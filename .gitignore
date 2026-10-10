@@ -1,0 +1,22 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+keys/
+*.pem
+*.key
+
+# runtime data
+*.sqlite3
+*.sqlite3-journal
+*.db
+*.log
+data/
+cache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.DS_Store
