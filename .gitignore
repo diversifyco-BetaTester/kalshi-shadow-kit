@@ -20,3 +20,20 @@ __pycache__/
 .venv/
 .pytest_cache/
 .DS_Store
+
+# local/: the sentinel pipeline's source is tracked; everything it writes at runtime is not (the alert
+# ledger, boards, line caches, odds cache, pool and heartbeat state, launchd plists with local paths, the
+# live pipeline_config.json tuning, backups and patch files)
+local/*
+!local/*.py
+
+# personal PrizePicks bookmarklet, never published
+scripts/
+
+# personal Claude Code notes (chat id, local paths), never published
+CLAUDE.md
+CLAUDE.local.md
+
+# alert ledger (also covered by local/*)
+local/slips_history.csv
+local/slips_history.lock
