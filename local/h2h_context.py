@@ -23,7 +23,9 @@ Model (predict):
        the player on another team then (a trade); NHL skater goals/assists/points: a different opposing starting
        goalie. Goalies are never key teammates. A game with no box score: MISSING_BOX_W.
   3. H2H rate = sum(w * stat) / sum(w * minutes): per minute, so blowouts, foul trouble and short nights don't
-     distort it. Effective sample size n_eff = (sum w)^2 / sum(w^2).
+     distort it. Effective sample size n_eff = (sum w)^2 / sum(w^2). The model rate blends it with the player's own
+     per-minute rate over his last RECENT_N games, counted as PRIOR_GAMES extra game(s): H2H stays primary (5
+     effective H2H games -> 5/6 of the blend), but 0 steals in 9 meetings no longer means P(over 0.5) = 0.
   4. Usage: for each key teammate whose presence differs between tonight and the H2H weight, the player's
      per-minute rate with vs without him this season (box scores of RECENT_N recent games; at least
      USAGE_MIN_WITH games with him and USAGE_MIN_WITHOUT without), shrunk by n_without / (n_without + USAGE_K), boosts (teammate out tonight) or trims (teammate back) the rate in
@@ -70,6 +72,7 @@ STATUS_MINUTES = {"questionable": 0.85, "day-to-day": 0.85, "doubtful": 0.6}
 GOALIE_STATS = {"goals", "assists", "points", "power play points"}
 POISSON_MAX, DISPERSION = 15.0, 1.8
 MIN_EFF_N = 2.0
+PRIOR_GAMES = 1.0           # the player's recent per-minute rate, as this many extra H2H games
 THRESHOLD = 0.56            # P(side | no push): 5/6-pick Flex breaks even near 54.2%, plus a margin
 
 SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/{path}/summary"
@@ -211,7 +214,9 @@ class Prediction:
     p_over: float | None = None       # P(over | no push)
     p_push: float = 0.0
     mu: float | None = None           # projected stat
-    rate: float | None = None         # H2H per-minute rate, before usage
+    rate: float | None = None         # model per-minute rate (H2H blended with recent form), before usage
+    h2h_rate: float | None = None     # the weighted H2H per-minute rate alone
+    recent_rate: float | None = None  # the player's per-minute rate over his last RECENT_N games
     usage: float = 1.0                # usage multiplier from absences
     exp_minutes: float | None = None
     n_h2h: int = 0
@@ -268,6 +273,9 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     if sport not in SUPPORTED:
         pred.notes.append(f"{sport.upper()} not supported: ESPN has no minutes or snap counts for it")
         return pred
+    if not enricher.COLUMNS.get(sport, {}).get(enricher.stat_phrase(sport, stat)):
+        pred.notes.append(f"{stat} isn't in ESPN game logs: no prediction")  # NHL hits / faceoffs / blocks, NBA dunks
+        return pred
     injuries, me = injuries or {}, nk(player)
     status = _status(injuries, player, team)
     if is_out(status):
@@ -314,7 +322,10 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
                            "weight": round(w, 3), "context": why})
     total = sum(weights)
     pred.n_eff = round(total ** 2 / sum(w * w for w in weights), 2)
-    pred.rate = sum(w * g.value for w, g in zip(weights, h2h)) / sum(w * g.minutes for w, g in zip(weights, h2h))
+    pred.h2h_rate = sum(w * g.value for w, g in zip(weights, h2h)) / sum(w * g.minutes for w, g in zip(weights, h2h))
+    form = sorted(played, key=lambda g: g.ts, reverse=True)[:RECENT_N]
+    pred.recent_rate = sum(g.value for g in form) / sum(g.minutes for g in form)
+    pred.rate = (pred.n_eff * pred.h2h_rate + PRIOR_GAMES * pred.recent_rate) / (pred.n_eff + PRIOR_GAMES)
 
     for p, games in sv.items():  # teammates whose presence differs between the H2H games and tonight
         share = sum(w for w, g in zip(weights, h2h) if g in games) / total
@@ -400,8 +411,15 @@ async def fetch_context(player: str, sport: str, stat: str, team: str, opp: str,
     current = season_of(datetime.fromtimestamp(now, timezone.utc).isoformat())
     for y in range(current, current - SEASONS, -1):
         params = {} if y == current else {"season": y}
-        log = await _cached(cache, f"log:{sport}:{aid}:{y}", CURRENT_TTL_S if y == current else None,
-                            lambda: get(url, params))
+
+        async def fetch(params=params, past=y != current):
+            try:
+                return await get(url, params)
+            except Exception as e:  # noqa: BLE001
+                if past and getattr(e, "status", None) == 404:
+                    return {}  # a rookie has no log for seasons before he played: zero games, not an error
+                raise
+        log = await _cached(cache, f"log:{sport}:{aid}:{y}", CURRENT_TTL_S if y == current else None, fetch)
         out["lines"] += lines_from_log(log, sport, stat, y)
     played = [g for g in out["lines"] if g.minutes > 0]
     wanted = [g for g in played if g.opp == canon(opp)]
@@ -450,7 +468,8 @@ def main() -> None:
     p = asyncio.run(run(a.player, a.sport, a.stat, a.line, a.team, a.opp))
     print(f"{p.player} {p.stat} {p.line:g} vs {p.opp}: "
           + (f"{p.side or 'no call'} · P(over) {p.p_over:.1%} · projection {p.mu:.2f} "
-             f"({p.rate:.3f}/min x usage {p.usage:.3f} x {p.exp_minutes:.1f} min) · "
+             f"({p.rate:.3f}/min [H2H {p.h2h_rate:.3f}, recent {p.recent_rate:.3f}] x usage {p.usage:.3f} "
+             f"x {p.exp_minutes:.1f} min) · "
              f"{p.n_h2h} H2H games, effective {p.n_eff:.1f}" if p.p_over is not None else "no prediction"))
     for g in p.games:
         print(f"  {g['date']}  {g['minutes']:>5} min  stat {g['stat']:g}  weight {g['weight']:.3f}"

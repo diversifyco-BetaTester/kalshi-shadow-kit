@@ -83,9 +83,15 @@ PITCHING = {"strikeouts", "hits allowed", "walks allowed", "earned runs", "pitch
 
 
 def stat_phrase(sport: str, stat: str) -> str:
-    """'Shots On Goal' / 'SOG' / 'shots on goal' -> 'shots on goal' (parse_board's mapping)."""
+    """'Shots On Goal' / 'SOG' / 'shots on goal' -> 'shots on goal' (parse_board's mapping). A phrase already in
+    canonical form passes through: the board writes combos as 'points + rebounds + assists', which collapsing the
+    spaces turned into 'points+rebounds+assists', a key nothing knows (every combo prop got no stats)."""
+    stats = SPORTS.get(sport, {}).get("stats", {})
+    spaced = " ".join(stat.lower().split())
+    if spaced in COLUMNS.get(sport, {}) or spaced in stats.values():
+        return spaced
     s = " ".join(stat.lower().replace(" + ", "+").split())
-    return SPORTS.get(sport, {}).get("stats", {}).get(s, s)
+    return stats.get(s, s)
 
 
 def row_value(cols: list[str], row: dict[str, str]) -> float | None:
@@ -106,7 +112,7 @@ def row_value(cols: list[str], row: dict[str, str]) -> float | None:
 
 
 def games(log: dict) -> list[dict]:
-    """Every non-preseason game in the log, newest first: {"date", "opp", "row": {column: cell}, "event": ESPN
+    """Every non-preseason, non-All-Star game in the log, newest first: {"date", "opp", "row": {column: cell}, "event": ESPN
     event id (its box score: local/h2h_context.py), "team": the player's team in that game (trades)}."""
     names, meta, out = log.get("names") or [], log.get("events") or {}, []
     for st in log.get("seasonTypes") or []:
@@ -115,6 +121,8 @@ def games(log: dict) -> list[dict]:
         for cat in st.get("categories") or []:
             for ev in cat.get("events") or []:
                 m = meta.get(ev.get("eventId"), {})
+                if "all-star" in (m.get("eventNote") or "").lower():  # filed under Regular Season by ESPN
+                    continue
                 stats = ev.get("stats") or []
                 row = {}
                 for name, cell in zip(names, stats):

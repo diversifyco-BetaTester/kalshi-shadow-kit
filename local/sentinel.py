@@ -92,7 +92,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from local import correlation, enricher, ev_pool, fetch_odds, injury_guard, integrity, ledger, optimizer, pipeline_config, snapshots
-from local import stat_research
+from local import h2h_context, h2h_shadow, stat_research
 from local import steam as steam_mod
 from local import prize_picks_ev_scraper as scanner
 from local.parse_board import SPORTS, board_path, lines_path, load_board, write_csv
@@ -398,6 +398,19 @@ def leg_floor(a, sport: str | None) -> float:
 
 def clears_floor(a, l: scanner.Leg) -> bool:
     return bool(l.pick) and l.pick[1] >= leg_floor(a, l.sport or a.sport)
+
+
+def h2h_on_board(a, rows: list[dict], board_ts: float) -> bool:
+    """Hand a new board to the H2H shadow model (NBA/NHL; local/h2h_shadow.py). Logged only, never alerted.
+    Never raises: the shadow model must not stop the board from being priced."""
+    runner = getattr(a, "h2h", None)
+    if runner is None:
+        return False
+    try:
+        return runner.submit(rows, board_ts)
+    except Exception as e:  # noqa: BLE001
+        print(f"{time.strftime('%H:%M:%S')} H2H shadow not started: {e!r}")
+        return False
 
 
 def background(a, coro) -> None:
@@ -784,6 +797,8 @@ async def main() -> None:
     ap.add_argument("--no-snapshots", dest="snapshot", action="store_false",
                     help="don't log boards, prices, closes and both builders' picks to data/snapshots_<sport>.sqlite3")
     ap.add_argument("--no-pool", action="store_true", help="don't share legs with other sports' sentinels")
+    ap.add_argument("--no-h2h-shadow", dest="h2h_shadow", action="store_false",
+                    help="don't run the H2H model (local/h2h_shadow.py, NBA/NHL) on each new board")
     ap.add_argument("--no-stat-feature", dest="stat_feature", action="store_false",
                     help="don't log the stats-vs-market gap (ESPN game logs) on chosen legs (a feature, never a veto)")
     ap.add_argument("--max-board-age", type=float, default=MAX_BOARD_AGE_MIN,
@@ -816,12 +831,14 @@ async def main() -> None:
     a.snapshots = snapshots.Snapshots(a.sport) if a.snapshot else None
     a.steam = steam_mod.SteamTracker()
     a.board_info = {}
+    a.h2h = (h2h_shadow.BoardRunner(a.sport) if a.h2h_shadow and a.sport in h2h_context.SUPPORTED else None)
 
     def on_board(feed, board_ts, rows, bad):
         a.board_info = {"board_ts": board_ts}  # whole lines now reach pricing; the cycle counts unpriced ones
         if a.snapshots is not None and not a.snapshots.has_board(board_ts):
             captured, props = snapshots.load_board_props(feed, a.sport)
             a.snapshots.board(board_ts, captured, props)
+        h2h_on_board(a, rows, board_ts)  # shadow: every prop projected in the background, logged, never alerted
     a.on_board = on_board
     print(f"sentinel: {a.sport.upper()} | feed {a.feed} or {a.board} | every {a.interval:.0f}s | alert >= {leg_floor(a, a.sport):.1%}{' (flex 5/6)' if a.flex else ''}"
           + (" · floors " + ", ".join(f"{s.upper()} {leg_floor(a, s):.1%}" for s in sorted(pipeline_config.CONFIG["min_fair_by_sport"]))
@@ -839,7 +856,9 @@ async def main() -> None:
         except Exception as e:  # a network blip shouldn't kill an all-evening watch
             print(f"{time.strftime('%H:%M:%S')} cycle failed: {e!r}")
         if a.once:
-            pending = a.__dict__.get("background_tasks") or set()
+            pending = set(a.__dict__.get("background_tasks") or set())
+            if getattr(a, "h2h", None) is not None and a.h2h.task is not None:
+                pending.add(a.h2h.task)  # and the H2H shadow run of the board just read
             if pending:  # let the stats feature finish logging before a one-shot run exits
                 await asyncio.wait(pending, timeout=60)
             return

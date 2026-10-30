@@ -105,7 +105,22 @@ def test_older_seasons_count_less():
     games = RECENT + [line("h1", "2026-10-10T23:00Z", 30, season=2027), line("h0", "2025-02-10T23:00Z", 10, season=2025)]
     p = predict(games, {"h1": box("h1", {ME: 30}), "h0": box("h0", {ME: 30})})
     assert [g["weight"] for g in p.games] == [1.0, pytest.approx(h.SEASON_DECAY ** 2, abs=1e-3)]
-    assert p.rate == pytest.approx((30 + 10 * h.SEASON_DECAY ** 2) / (30 * (1 + h.SEASON_DECAY ** 2)))
+    assert p.h2h_rate == pytest.approx((30 + 10 * h.SEASON_DECAY ** 2) / (30 * (1 + h.SEASON_DECAY ** 2)))
+
+
+def test_recent_form_is_one_extra_game_so_h2h_stays_primary():
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 30) for i in range(5)]   # H2H 1.0/min, recent 0.67
+    boxes = {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}
+    p = predict(games, boxes)
+    assert p.h2h_rate == pytest.approx(1.0) and p.recent_rate == pytest.approx(25 / 30)   # last 10 incl. H2H
+    assert p.rate == pytest.approx((5 * 1.0 + h.PRIOR_GAMES * 25 / 30) / (5 + h.PRIOR_GAMES))
+
+
+def test_never_recording_the_stat_in_h2h_is_not_certainty():
+    games = [line(g.event_id, g.date, 1, 30.0, opp="XXX") for g in RECENT] + \
+            [line(f"h{i}", f"2026-10-1{i}T23:00Z", 0) for i in range(9)]               # 0 steals in 9 meetings
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(9)}, stat="steals", line_=0.5)
+    assert p.h2h_rate == 0 and p.mu > 0 and 0.01 < p.p_over < 0.5 and p.side == "Less"
 
 
 # --------------------------------------------------------------------------- absence context
@@ -223,7 +238,12 @@ def test_sides_need_the_threshold_and_enough_h2h():
     close = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 21) for i in range(3)])
     assert (more.side, less.side, close.side) == ("More", "Less", None)
     thin = predict(RECENT + [line("h1", "2026-10-10T23:00Z", 35)])
-    assert thin.side is None and thin.p_over > 0.9 and any("thin H2H" in n for n in thin.notes)
+    assert thin.side is None and thin.p_over > 0.8 and any("thin H2H" in n for n in thin.notes)
+
+
+def test_a_stat_espn_doesnt_log_says_so():
+    p = predict(RECENT, sport="nhl", stat="hits", line_=1.5)
+    assert p.p_over is None and "hits isn't in ESPN game logs" in p.notes[0]
 
 
 def test_no_h2h_and_unsupported_sports():
@@ -268,3 +288,28 @@ def test_fetch_context_requests_three_seasons_and_caches_finals(tmp_path, monkey
     asyncio.run(h.fetch_context(ME, "nba", "points", TEAM, OPP, get=get, cache=cache, now=now))
     assert calls == []                                    # current season within its TTL, the rest kept forever
     assert asyncio.run(h.fetch_context(ME, "nfl", "receptions", "PIT", "NO", get=get, cache=cache))["lines"] == []
+
+
+def test_a_rookie_without_past_seasons_still_gets_this_seasons_games(tmp_path, monkeypatch):
+    class NotFound(Exception):
+        status = 404
+
+    async def get(url, params):
+        if url.endswith("/gamelog"):
+            if params.get("season"):
+                raise NotFound("no log for that season")
+            return {"names": ["minutes", "points"],
+                    "events": {"e1": {"gameDate": "2026-10-20T00:00Z", "team": {"abbreviation": TEAM}, "opponent": {"abbreviation": OPP}}},
+                    "seasonTypes": [{"displayName": "Regular Season", "categories": [{"events": [{"eventId": "e1", "stats": ["30", "20"]}]}]}]}
+        return {}
+
+    async def find(name, sport, team, get_):
+        return "9", ""
+
+    async def no_injuries(sport, get_):
+        return {}
+    monkeypatch.setattr(h.enricher, "find_athlete", find)
+    monkeypatch.setattr(h.injury_guard, "injuries", no_injuries)
+    now = h.datetime(2026, 10, 30, tzinfo=h.timezone.utc).timestamp()
+    ctx = asyncio.run(h.fetch_context(ME, "nba", "points", TEAM, OPP, get=get, cache=h.Cache(tmp_path / "c.sqlite3"), now=now))
+    assert [g.event_id for g in ctx["lines"]] == ["e1"]
