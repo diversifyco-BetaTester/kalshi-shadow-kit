@@ -106,7 +106,8 @@ def row_value(cols: list[str], row: dict[str, str]) -> float | None:
 
 
 def games(log: dict) -> list[dict]:
-    """Every non-preseason game in the log, newest first: {"date", "opp", "row": {column: cell}}."""
+    """Every non-preseason game in the log, newest first: {"date", "opp", "row": {column: cell}, "event": ESPN
+    event id (its box score: local/h2h_context.py), "team": the player's team in that game (trades)}."""
     names, meta, out = log.get("names") or [], log.get("events") or {}, []
     for st in log.get("seasonTypes") or []:
         if "preseason" in (st.get("displayName") or "").lower():
@@ -123,7 +124,8 @@ def games(log: dict) -> list[dict]:
                     else:
                         row[name] = cell
                 out.append({"date": m.get("gameDate", ""), "opp": (m.get("opponent") or {}).get("abbreviation", ""),
-                            "row": row})
+                            "row": row, "event": str(ev.get("eventId") or ""),
+                            "team": (m.get("team") or {}).get("abbreviation", "")})
     return sorted(out, key=lambda g: g["date"], reverse=True)
 
 
