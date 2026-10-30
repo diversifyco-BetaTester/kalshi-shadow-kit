@@ -8,13 +8,15 @@ never wait on ESPN. A board that lands while one is still running waits and runs
 newest is kept.
 
 Logged to data/h2h_shadow.sqlite3 (gitignored), table h2h_predictions: one row per prop when its prediction
-CHANGES (side, P(over) by 0.5 pt+, projection, or the context notes), plus the first sighting. Props repeat on
+CHANGES (side, P(over) by 0.5 pt+, projection, or the context notes), plus the first sighting. Each row carries
+model_version (h2h_context.MODEL_VERSION); rows from before versioning have none and count as "v1" (VERSION_SQL).
+A new version always logs a fresh row, so grading can keep versions apart (local/h2h_grade.py). Props repeat on
 every 15-minute dump; a change (a teammate ruled out at 5 pm) is exactly what the log should catch. Each row has
 the full context: weights and mismatches per H2H game (games_json), usage, expected minutes, notes.
 
 NBA and NHL only: ESPN has no minutes for NFL (see h2h_context).
 
-  python3 -m local.h2h_shadow --report      # what the shadow log holds, by sport and call
+  python3 -m local.h2h_shadow --report      # what the shadow log holds, by model version, sport and call
 """
 from __future__ import annotations
 
@@ -40,6 +42,14 @@ CREATE TABLE IF NOT EXISTS h2h_predictions (id INTEGER PRIMARY KEY, ts REAL, boa
     error TEXT);
 CREATE INDEX IF NOT EXISTS h2h_prop ON h2h_predictions (sport, player, stat, line, start_ts, id);
 """
+UNVERSIONED = "v1"  # rows logged before model_version existed
+
+
+def version_sql(db: sqlite3.Connection) -> str:
+    """The SQL expression for a row's model version, on a log with or without the column (a read-only reader
+    can't add it: the 6 AM grader opens the log read-only)."""
+    has = any(r[1] == "model_version" for r in db.execute("PRAGMA table_info(h2h_predictions)"))
+    return f"COALESCE(model_version, '{UNVERSIONED}')" if has else f"'{UNVERSIONED}'"
 
 
 def opponent_of(game: str, team: str) -> str | None:
@@ -79,34 +89,39 @@ class ShadowLog:
         self.db.execute("PRAGMA journal_mode=WAL")   # the NBA and NHL sentinels share this file
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        if not any(r[1] == "model_version" for r in self.db.execute("PRAGMA table_info(h2h_predictions)")):
+            self.db.execute("ALTER TABLE h2h_predictions ADD COLUMN model_version TEXT")  # existing rows: v1
+            self.db.commit()
 
     def _last(self, sport: str, prop: dict):
-        return self.db.execute("SELECT side, p_over, mu, notes_json, error FROM h2h_predictions WHERE sport=? AND "
-                               "player=? AND stat=? AND line=? AND start_ts=? ORDER BY id DESC LIMIT 1",
+        return self.db.execute(f"SELECT side, p_over, mu, notes_json, error, {version_sql(self.db)} FROM h2h_predictions "
+                               "WHERE sport=? AND player=? AND stat=? AND line=? AND start_ts=? ORDER BY id DESC LIMIT 1",
                                (sport, prop["player"], prop["stat"], prop["line"], prop["start_ts"])).fetchone()
 
     def record(self, sport: str, prop: dict, pred: h2h_context.Prediction | None, board_ts: float, now: float,
                error: str = "") -> bool:
-        """Write the prediction if it differs from the prop's last row; True when a row was written."""
+        """Write the prediction if it differs from the prop's last row, or that row came from another model
+        version; True when a row was written."""
         notes = json.dumps(pred.notes if pred else [])
         last = self._last(sport, prop)
         if last is not None:
-            side, p, mu, last_notes, last_err = last
+            side, p, mu, last_notes, last_err, version = last
             same_p = (p is None and (pred is None or pred.p_over is None)) or (
                 p is not None and pred is not None and pred.p_over is not None and abs(p - pred.p_over) < P_CHANGE)
             same_mu = (mu is None and (pred is None or pred.mu is None)) or (
                 mu is not None and pred is not None and pred.mu is not None and abs(mu - pred.mu) < 0.01)
-            if (side == (pred.side if pred else None) and same_p and same_mu and last_notes == notes
-                    and (last_err or "") == error):
+            if (version == h2h_context.MODEL_VERSION and side == (pred.side if pred else None) and same_p and same_mu
+                    and last_notes == notes and (last_err or "") == error):
                 return False
         g = (lambda k: getattr(pred, k) if pred else None)
         self.db.execute(
             "INSERT INTO h2h_predictions (ts, board_ts, sport, player, stat, line, odds_type, team, opp, start_ts, side, "
-            "p_over, p_push, mu, rate, usage, exp_minutes, n_h2h, n_eff, notes_json, games_json, error) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "p_over, p_push, mu, rate, usage, exp_minutes, n_h2h, n_eff, notes_json, games_json, error, model_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, board_ts, sport, prop["player"], prop["stat"], prop["line"], prop["odds_type"], prop["team"],
              prop["opp"], prop["start_ts"], g("side"), g("p_over"), g("p_push"), g("mu"), g("rate"), g("usage"),
-             g("exp_minutes"), g("n_h2h"), g("n_eff"), notes, json.dumps(pred.games if pred else []), error or None))
+             g("exp_minutes"), g("n_h2h"), g("n_eff"), notes, json.dumps(pred.games if pred else []), error or None,
+             h2h_context.MODEL_VERSION))
         self.db.commit()
         return True
 
@@ -173,9 +188,12 @@ class BoardRunner:
 
 def report(path: Path | str = DB) -> str:
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    rows = db.execute("SELECT sport, COALESCE(side, 'no call'), COUNT(*), COUNT(DISTINCT player || stat || line || start_ts) "
-                      "FROM h2h_predictions GROUP BY 1, 2 ORDER BY 1, 2").fetchall()
-    return "\n".join(f"{s.upper():4} {side:8} {n:6} rows, {props:5} props" for s, side, n, props in rows) or "empty"
+    rows = db.execute(f"SELECT {version_sql(db)}, sport, COALESCE(side, 'no call'), COUNT(*), "
+                      "COUNT(DISTINCT player || stat || line || start_ts) FROM h2h_predictions GROUP BY 1, 2, 3 "
+                      "ORDER BY 1, 2, 3").fetchall()
+    return "\n".join(f"{v:4} {s.upper():4} {side:8} {n:6} rows, {props:5} props"
+                     + ("  (current)" if v == h2h_context.MODEL_VERSION else "")
+                     for v, s, side, n, props in rows) or "empty"
 
 
 def main() -> None:

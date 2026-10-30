@@ -160,3 +160,40 @@ def test_the_shadow_model_never_alerts(tmp_path, monkeypatch):
     log = h2h_shadow.ShadowLog(tmp_path / "s.sqlite3")
     asyncio.run(h2h_shadow.run_board("nba", [row()], 1.0, log, NOW, predictor=predictor({"Star Guy": pred()})))
     assert len(rows_in(log)) == 1 and sent == []
+
+
+# --------------------------------------------------------------------------- model versions
+OLD_SCHEMA = h2h_shadow.SCHEMA  # the same table, created before model_version existed (no such column)
+
+
+def old_log(path):
+    db = sqlite3.connect(path)
+    db.executescript(OLD_SCHEMA)
+    db.execute("INSERT INTO h2h_predictions (ts, sport, player, stat, line, start_ts, side, p_over) "
+               "VALUES (1, 'nba', 'Old Row', 'points', 24.5, 9e9, 'Less', 0.2)")
+    db.commit()
+    db.close()
+
+
+def test_an_old_log_gains_the_column_and_its_rows_count_as_v1(tmp_path):
+    path = tmp_path / "s.sqlite3"
+    old_log(path)
+    assert h2h_shadow.version_sql(sqlite3.connect(path)) == "'v1'"              # readable before any upgrade
+    log = h2h_shadow.ShadowLog(path)                                           # a sentinel on the new code opens it
+    asyncio.run(h2h_shadow.run_board("nba", [row()], 1.0, log, NOW, predictor=predictor({"Star Guy": pred()})))
+    versions = dict(sqlite3.connect(path).execute(
+        f"SELECT player, {h2h_shadow.version_sql(log.db)} FROM h2h_predictions").fetchall())
+    assert versions == {"Old Row": "v1", "Star Guy": h2h_context.MODEL_VERSION}
+    text = h2h_shadow.report(path)
+    assert "v1   NBA  Less" in text and f"{h2h_context.MODEL_VERSION:4} NBA  More" in text and "(current)" in text
+
+
+def test_a_new_model_version_always_logs_a_fresh_row(tmp_path, monkeypatch):
+    log = h2h_shadow.ShadowLog(tmp_path / "s.sqlite3")
+    same = predictor({"Star Guy": pred()})
+    monkeypatch.setattr(h2h_context, "MODEL_VERSION", "v1")
+    asyncio.run(h2h_shadow.run_board("nba", [row()], 1.0, log, NOW, predictor=same))
+    monkeypatch.setattr(h2h_context, "MODEL_VERSION", "v2")
+    asyncio.run(h2h_shadow.run_board("nba", [row()], 2.0, log, NOW, predictor=same))   # identical prediction
+    asyncio.run(h2h_shadow.run_board("nba", [row()], 3.0, log, NOW, predictor=same))   # same version: no row
+    assert log.db.execute("SELECT model_version FROM h2h_predictions ORDER BY id").fetchall() == [("v1",), ("v2",)]

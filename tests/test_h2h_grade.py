@@ -127,3 +127,47 @@ def test_no_shadow_log_yet(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["h2h_grade", "--db", str(tmp_path / "missing.sqlite3")])
     with pytest.raises(SystemExit, match="no shadow log yet"):
         h2h_grade.main()
+
+
+# --------------------------------------------------------------------------- model versions
+def test_only_the_current_version_is_graded_by_default(tmp_path, log, monkeypatch):
+    monkeypatch.setattr(h2h_context, "MODEL_VERSION", "v1")
+    log_pred(log, "A", "More", 0.95, ts=START - 600)                          # the old model, logged later
+    monkeypatch.setattr(h2h_context, "MODEL_VERSION", "v2")
+    log_pred(log, "A", "Less", 0.40, ts=START - 7200)                         # the current model, earlier
+    log_pred(log, "B", "More", 0.60)
+    path = tmp_path / "s.sqlite3"
+    current = h2h_grade.predictions(path, version="v2")
+    assert [(r["player"], r["side"], r["version"]) for r in current] == [("A", "Less", "v2"), ("B", "More", "v2")]
+    assert [(r["player"], r["side"]) for r in h2h_grade.predictions(path, version="v1")] == [("A", "More")]
+    both = h2h_grade.predictions(path, version=None)                         # each version's own last row
+    assert sorted((r["player"], r["version"]) for r in both) == [("A", "v1"), ("A", "v2"), ("B", "v2")]
+
+
+def test_all_versions_adds_a_by_version_slice(tmp_path, log, monkeypatch):
+    for version, players in (("v1", ("A", "B")), ("v2", ("C",))):
+        monkeypatch.setattr(h2h_context, "MODEL_VERSION", version)
+        for p in players:
+            log_pred(log, p, "More", 0.6)
+    rows = h2h_grade.predictions(tmp_path / "s.sqlite3", version=None)
+    outcomes = backtest.Outcomes(tmp_path / "o.sqlite3", grader=FakeGrader({"A": "hit", "B": "miss", "C": "hit"}), fetch=True)
+    text = h2h_grade.report(h2h_grade.attach_outcomes(rows, outcomes, NOW), version=None)
+    assert "all model versions: v1, v2" in text and "by model version:" in text
+    assert "  v1                     n=2    hit 50.0%" in text and "  v2                     n=1    hit 100.0%" in text
+    monkeypatch.setattr(h2h_context, "MODEL_VERSION", "v2")
+    one = h2h_grade.report(h2h_grade.attach_outcomes(h2h_grade.predictions(tmp_path / "s.sqlite3"), outcomes, NOW))
+    assert "model v2 (current)" in one and "by model version" not in one
+
+
+def test_a_log_never_upgraded_still_grades_as_v1(tmp_path):
+    import sqlite3
+    path = tmp_path / "s.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript(h2h_shadow.SCHEMA)                                       # no model_version column
+    db.execute("INSERT INTO h2h_predictions (ts, sport, player, stat, line, odds_type, team, start_ts, side, p_over, n_eff) "
+               "VALUES (?, 'nba', 'Old', 'points', 24.5, 'standard', 'LAL', ?, 'More', 0.6, 3)", (START - 60, START))
+    db.commit()
+    db.close()
+    assert h2h_grade.predictions(path) == []                                  # the current version has none
+    [old] = h2h_grade.predictions(path, version="v1")
+    assert old["player"] == "Old" and old["version"] == "v1"

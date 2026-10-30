@@ -68,6 +68,10 @@ from local import enricher, injury_guard
 from local.grade_slips import canon, name_key
 
 SUPPORTED = ("nba", "nhl")
+# Bump whenever the model's logic or constants change, so the shadow log and grading keep versions apart:
+#   v1  2026-10-30 the first engine (1f2efea..720d7b3); rows logged before versioning (no tag) are v1
+#   v2  2026-10-30 goalie, usage-cap, role-change and line-gap guards, widened/capped probabilities (4cbae41)
+MODEL_VERSION = "v2"
 MINUTES = {"nba": ["min:minutes"], "nhl": ["min:timeOnIcePerGame"]}
 SEASONS = 3                 # current + 2 previous
 SEASON_DECAY = 0.75         # weight per season of age
