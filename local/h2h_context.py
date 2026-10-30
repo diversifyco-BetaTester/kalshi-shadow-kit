@@ -33,8 +33,19 @@ Model (predict):
   5. Expected minutes: mean of his last 5 played games; a minutes restriction (first game back after a
      RESTRICT_GAP_DAYS+ absence at under RESTRICT_RATIO of his usual minutes) caps it at that game's minutes;
      Questionable / Doubtful / Day-To-Day scale it by STATUS_MINUTES. Out / IR / suspended: no prediction.
-  6. Projection mu = rate x usage x expected minutes; P(over), P(push) from a Poisson (mu <= POISSON_MAX) or a
-     normal with variance DISPERSION x mu. A side only when P(side | no push) >= threshold AND n_eff >= MIN_EFF_N.
+  6. Projection mu = rate x usage x expected minutes. P(over), P(push) from a negative binomial (mu <= POISSON_MAX)
+     or a normal, with variance DISPERSION x mu (game-to-game swings) + mu^2 / (n_eff + prior) (the rate itself is
+     an estimate from a few games), capped to [1 - MAX_CONF, MAX_CONF] until graded calibration supports more.
+     A side only when P(side | no push) >= threshold AND n_eff >= MIN_EFF_N.
+
+Guards added 2026-10-30 after the first live board, whose most confident calls were all model artifacts:
+  goalies    a saves prop needs the player to be his team's probable starter (else no prediction) and expects a
+             full game (GOALIE_MINUTES): no minutes-restriction guess from a relief appearance, no skater usage.
+  usage      only the strongest teammate factor is applied, capped at +/- USAGE_CAP: several factors from the
+             same few games were multiplying (x1.94).
+  role       a recent per-minute rate more than ROLE_RATIO away from the H2H one (a bench player now starting)
+             weighs recent form equal to the H2H games, not as one extra game; and a projection more than
+             LINE_GAP from a line of LINE_GAP_MIN+ gets no call: the line knows about a role the model misses.
 
 All constants are starting values, not fitted: log predictions next to graded results and tune them.
 
@@ -70,7 +81,13 @@ USAGE_MIN_WITH, USAGE_MIN_WITHOUT = 3, 2
 RESTRICT_RATIO, RESTRICT_GAP_DAYS = 0.75, 7
 STATUS_MINUTES = {"questionable": 0.85, "day-to-day": 0.85, "doubtful": 0.6}
 GOALIE_STATS = {"goals", "assists", "points", "power play points"}
-POISSON_MAX, DISPERSION = 15.0, 1.8
+POISSON_MAX, DISPERSION = 15.0, 1.5  # variance = DISPERSION x mu (+ rate uncertainty, see prob_over)
+MAX_CONF = 0.85             # P(over) clamped to [0.15, 0.85] until graded calibration supports more
+GOALIE_PROPS = {"saves"}    # needs the probable starter, expects a full game
+GOALIE_MINUTES = 60.0
+USAGE_CAP = 0.15            # the one usage factor applied, clamped to [0.85, 1.15]
+ROLE_RATIO = 1.5            # recent vs H2H per-minute rate this far apart (either way): a role change
+LINE_GAP, LINE_GAP_MIN = 0.40, 3.0  # projection > 40% from a line of 3+: no call
 MIN_EFF_N = 2.0
 PRIOR_GAMES = 1.0           # the player's recent per-minute rate, as this many extra H2H games
 THRESHOLD = 0.56            # P(side | no push): 5/6-pick Flex breaks even near 54.2%, plus a margin
@@ -185,20 +202,24 @@ def key_players(boxes: list[Box], team: str, exclude: str, sport: str) -> list[s
     return sorted(p for p, ms in played.items() if p != exclude and fmean(ms) >= KEY_MIN[sport])
 
 
-def prob_over(mu: float, line: float) -> tuple[float, float]:
-    """(P(stat > line), P(stat == line)); the push is 0 for a half line."""
+def prob_over(mu: float, line: float, var: float | None = None) -> tuple[float, float]:
+    """(P(stat > line), P(stat == line)); the push is 0 for a half line. `var`: the variance (default: Poisson,
+    var = mu, for low projections; DISPERSION x mu above POISSON_MAX). A variance above mu makes the low-count
+    model a negative binomial with that variance."""
     whole = abs(line % 1) < 1e-9
     if mu <= 0:
         return 0.0, 1.0 if whole and line == 0 else 0.0
     if mu <= POISSON_MAX:
-        k, pmf, cdf = int(math.floor(line)), math.exp(-mu), 0.0
-        for i in range(k + 1):
-            if i:
-                pmf *= mu / i
-            cdf += pmf
-        push = pmf if whole else 0.0
-        return max(0.0, 1.0 - cdf), push
-    nd = NormalDist(mu, math.sqrt(DISPERSION * mu))
+        k = int(math.floor(line))
+        if var is None or var <= mu * (1 + 1e-9):
+            pmfs = [math.exp(-mu + i * math.log(mu) - math.lgamma(i + 1)) for i in range(k + 1)]
+        else:
+            r = mu * mu / (var - mu)
+            lp, lq = math.log(r / (r + mu)), math.log(mu / (r + mu))
+            pmfs = [math.exp(math.lgamma(i + r) - math.lgamma(r) - math.lgamma(i + 1) + r * lp + i * lq)
+                    for i in range(k + 1)]
+        return max(0.0, 1.0 - sum(pmfs)), (pmfs[-1] if whole else 0.0)
+    nd = NormalDist(mu, math.sqrt(var if var is not None else DISPERSION * mu))
     if whole:
         return 1 - nd.cdf(line + 0.5), nd.cdf(line + 0.5) - nd.cdf(line - 0.5)
     return 1 - nd.cdf(line), 0.0
@@ -267,7 +288,8 @@ def usage_factor(recent: list[GameLine], boxes: dict[str, Box], team: str, mate:
 
 def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str, lines: list[GameLine],
             boxes: dict[str, Box], injuries: dict | None = None, opp_goalie: str | None = None,
-            threshold: float = THRESHOLD) -> Prediction:
+            threshold: float = THRESHOLD, starter: str | None = None) -> Prediction:
+    """`starter`: the player's team's probable starting goalie (NHL; saves props need it)."""
     team, opp = canon(team), canon(opp)
     pred = Prediction(player, stat, line, opp)
     if sport not in SUPPORTED:
@@ -280,6 +302,13 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     status = _status(injuries, player, team)
     if is_out(status):
         pred.notes.append(f"player is {status}: no prediction")
+        return pred
+    goalie_prop = sport == "nhl" and stat_is(sport, stat, GOALIE_PROPS)
+    if goalie_prop and starter is None:
+        pred.notes.append(f"no probable starting goalie posted for {team} yet: no prediction")
+        return pred
+    if goalie_prop and nk(starter) != me:
+        pred.notes.append(f"not {team}'s probable starter ({starter}): no prediction")
         return pred
     played = [g for g in lines if g.minutes > 0]
     h2h = [g for g in played if g.opp == opp]
@@ -325,29 +354,58 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     pred.h2h_rate = sum(w * g.value for w, g in zip(weights, h2h)) / sum(w * g.minutes for w, g in zip(weights, h2h))
     form = sorted(played, key=lambda g: g.ts, reverse=True)[:RECENT_N]
     pred.recent_rate = sum(g.value for g in form) / sum(g.minutes for g in form)
-    pred.rate = (pred.n_eff * pred.h2h_rate + PRIOR_GAMES * pred.recent_rate) / (pred.n_eff + PRIOR_GAMES)
+    prior = PRIOR_GAMES
+    lo, hi = sorted((pred.h2h_rate, pred.recent_rate))
+    if hi > 0 and hi > ROLE_RATIO * lo:  # a bench player now starting, or the reverse: the H2H era is stale
+        prior = max(PRIOR_GAMES, pred.n_eff)
+        pred.notes.append(f"role change: {pred.recent_rate:.3f}/min recently vs {pred.h2h_rate:.3f}/min in the H2H "
+                          f"games, recent form weighted equal to H2H")
+    pred.rate = (pred.n_eff * pred.h2h_rate + prior * pred.recent_rate) / (pred.n_eff + prior)
 
-    for p, games in sv.items():  # teammates whose presence differs between the H2H games and tonight
+    factors = []  # teammates whose presence differs between the H2H games and tonight
+    for p, games in ([] if goalie_prop else sv.items()):
         share = sum(w for w, g in zip(weights, h2h) if g in games) / total
         f, n_wo = usage_factor(recent, boxes, team, p)
         if f != 1.0:
             sign = 1 if p in out_tonight else -1
-            pred.usage *= f ** (sign * share)
-            pred.notes.append(f"usage {'with' if sign < 0 else 'without'} {p}: x{f ** (sign * share):.3f} "
-                              f"({n_wo} recent games without him, {share:.0%} of H2H weight differs)")
+            factors.append((f ** (sign * share), p, sign, n_wo, share))
+    if factors:  # the strongest one only: they come from the same few games and would double-count
+        f, p, sign, n_wo, share = max(factors, key=lambda x: abs(math.log(x[0])))
+        pred.usage = min(1 + USAGE_CAP, max(1 - USAGE_CAP, f))
+        pred.notes.append(f"usage {'with' if sign < 0 else 'without'} {p}: x{pred.usage:.3f}"
+                          + (f" (x{f:.3f} capped)" if pred.usage != f else "")
+                          + f" ({n_wo} recent games without him, {share:.0%} of H2H weight differs"
+                          + (f"; strongest of {len(factors)}" if len(factors) > 1 else "") + ")")
 
-    pred.exp_minutes = expected_minutes(lines, status, pred.notes)
+    if goalie_prop:
+        pred.exp_minutes = GOALIE_MINUTES
+        pred.notes.append(f"probable starter: a full game ({GOALIE_MINUTES:g} min) expected")
+    else:
+        pred.exp_minutes = expected_minutes(lines, status, pred.notes)
     if pred.exp_minutes is None:
         pred.notes.append("no recent minutes")
         return pred
     pred.mu = pred.rate * pred.usage * pred.exp_minutes
-    over, pred.p_push = prob_over(pred.mu, line)
+    var = DISPERSION * pred.mu + pred.mu ** 2 / (pred.n_eff + prior)  # game swings + the rate's own uncertainty
+    over, pred.p_push = prob_over(pred.mu, line, var)
     decided = 1 - pred.p_push
     pred.p_over = over / decided if decided > 0 else None
     if pred.p_over is None:
         return pred
+    capped = min(MAX_CONF, max(1 - MAX_CONF, pred.p_over))
+    if capped != pred.p_over:
+        pred.notes.append(f"P(over) {pred.p_over:.1%} capped at {capped:.0%} until calibration supports more")
+        pred.p_over = capped
+    gap = abs(pred.mu - line) / line if line >= LINE_GAP_MIN else 0.0
+    blocked = []  # every reason is logged, not just the first
+    if gap > LINE_GAP:
+        blocked.append(f"projection {pred.mu:.1f} is {gap:.0%} from the line {line:g}: likely a role or minutes "
+                       f"change the model misses, no call")
     if pred.n_eff < MIN_EFF_N:
-        pred.notes.append(f"thin H2H: effective sample {pred.n_eff:.1f} < {MIN_EFF_N:g}, no call")
+        blocked.append(f"thin H2H: effective sample {pred.n_eff:.1f} < {MIN_EFF_N:g}, no call")
+    pred.notes += blocked
+    if blocked:
+        pass
     elif pred.p_over >= threshold:
         pred.side = "More"
     elif 1 - pred.p_over >= threshold:
@@ -397,10 +455,10 @@ async def _cached(cache: Cache, key: str, ttl: float | None, fetch):
 
 async def fetch_context(player: str, sport: str, stat: str, team: str, opp: str, get=None,
                         cache: Cache | None = None, now: float | None = None) -> dict:
-    """Everything predict() needs: {"lines", "boxes", "injuries", "opp_goalie", "error"}."""
+    """Everything predict() needs: {"lines", "boxes", "injuries", "opp_goalie", "starter", "error"}."""
     get, cache = get or enricher.http_get, cache or Cache()
     now = time.time() if now is None else now
-    out = {"lines": [], "boxes": {}, "injuries": {}, "opp_goalie": None, "error": ""}
+    out = {"lines": [], "boxes": {}, "injuries": {}, "opp_goalie": None, "starter": None, "error": ""}
     if sport not in SUPPORTED:
         return out
     aid, why = await enricher.find_athlete(player, sport, team, get)
@@ -442,7 +500,9 @@ async def fetch_context(player: str, sport: str, stat: str, team: str, opp: str,
     if sport == "nhl":
         day = (datetime.fromtimestamp(now, timezone.utc) - timedelta(hours=5)).strftime("%Y%m%d")
         try:
-            out["opp_goalie"] = ((await injury_guard.starters(sport, day, get1)).get(canon(opp)) or (None,))[0]
+            probables = await injury_guard.starters(sport, day, get1)
+            out["opp_goalie"] = (probables.get(canon(opp)) or (None,))[0]
+            out["starter"] = (probables.get(canon(team)) or (None,))[0]
         except Exception:  # noqa: BLE001
             pass
     return out
@@ -450,7 +510,8 @@ async def fetch_context(player: str, sport: str, stat: str, team: str, opp: str,
 
 async def run(player: str, sport: str, stat: str, line: float, team: str, opp: str, **kw) -> Prediction:
     ctx = await fetch_context(player, sport, stat, team, opp, **kw)
-    pred = predict(player, sport, stat, line, team, opp, ctx["lines"], ctx["boxes"], ctx["injuries"], ctx["opp_goalie"])
+    pred = predict(player, sport, stat, line, team, opp, ctx["lines"], ctx["boxes"], ctx["injuries"], ctx["opp_goalie"],
+                   starter=ctx["starter"])
     if ctx["error"]:
         pred.notes.append(ctx["error"])
     return pred

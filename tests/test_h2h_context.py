@@ -224,7 +224,7 @@ def test_status_out_means_no_prediction():
 
 
 def test_questionable_cuts_minutes_and_blocks_more():
-    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 40) for i in range(4)]  # 40 a game: a big More
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 27) for i in range(4)]  # 27 a game: a More at 20.5
     healthy = predict(games)
     q = predict(games, injuries=injured((TEAM, ME), status="Questionable"))
     assert healthy.side == "More" and q.exp_minutes == pytest.approx(30 * 0.85)
@@ -233,12 +233,13 @@ def test_questionable_cuts_minutes_and_blocks_more():
 
 # --------------------------------------------------------------------------- calls
 def test_sides_need_the_threshold_and_enough_h2h():
-    more = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 35) for i in range(3)])
-    less = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 8) for i in range(3)])
-    close = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 21) for i in range(3)])
+    boxes = {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}
+    more = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 27) for i in range(5)], boxes)
+    less = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 15) for i in range(5)], boxes)
+    close = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 21) for i in range(5)], boxes)
     assert (more.side, less.side, close.side) == ("More", "Less", None)
     thin = predict(RECENT + [line("h1", "2026-10-10T23:00Z", 35)])
-    assert thin.side is None and thin.p_over > 0.8 and any("thin H2H" in n for n in thin.notes)
+    assert thin.side is None and thin.p_over > h.THRESHOLD and any("thin H2H" in n for n in thin.notes)
 
 
 def test_a_stat_espn_doesnt_log_says_so():
@@ -313,3 +314,74 @@ def test_a_rookie_without_past_seasons_still_gets_this_seasons_games(tmp_path, m
     now = h.datetime(2026, 10, 30, tzinfo=h.timezone.utc).timestamp()
     ctx = asyncio.run(h.fetch_context(ME, "nba", "points", TEAM, OPP, get=get, cache=h.Cache(tmp_path / "c.sqlite3"), now=now))
     assert [g.event_id for g in ctx["lines"]] == ["e1"]
+
+
+# --------------------------------------------------------------------------- guards (2026-10-30)
+def goalie_games(saves=27, minutes=60.0):
+    games = [line(f"r{i}", f"2026-10-{28 - 2 * i:02d}T23:00Z", saves, minutes, opp="XXX") for i in range(4)]
+    games.append(line("relief", "2026-10-29T23:00Z", 12, 40.0, opp="XXX"))       # pulled / relief appearance
+    games[1] = line("r1", "2026-10-10T23:00Z", saves, minutes, opp="XXX")         # 19-day gap before the 40 min
+    return games + [line(f"h{i}", f"2026-10-0{i + 1}T23:00Z", saves, minutes) for i in range(4)]
+
+
+def test_a_saves_prop_needs_the_probable_starter():
+    games = goalie_games()
+    none = predict(games, sport="nhl", stat="saves", line_=25.5)
+    other = predict(games, sport="nhl", stat="saves", line_=25.5, starter="Backup Guy")
+    assert none.p_over is None and "no probable starting goalie" in none.notes[0]
+    assert other.p_over is None and "not LAL's probable starter (Backup Guy)" in other.notes[0]
+
+
+def test_a_starting_goalie_expects_a_full_game_not_a_restriction():
+    boxes = {f"h{i}": box(f"h{i}", {ME: 60}) for i in range(4)}
+    p = predict(goalie_games(), boxes, sport="nhl", stat="saves", line_=25.5, starter=ME)
+    assert p.exp_minutes == h.GOALIE_MINUTES and not any("restriction" in n for n in p.notes)
+    assert p.usage == 1.0                                                         # skaters never move a goalie's saves
+
+
+def test_only_the_strongest_usage_factor_applies_and_it_is_capped():
+    games, boxes = usage_games(with_value=20, without_value=40)                    # x2 per minute without him: huge
+    for i in range(4):                                                            # a second teammate, weaker effect
+        boxes[f"u{i}"].minutes[TEAM]["side kick"] = 30
+    games += [line("h1", "2026-10-01T23:00Z", 20)]
+    boxes["h1"] = box("h1", {ME: 30, "Co Star": 34, "Side Kick": 30})
+    p = predict(games, boxes, injured((TEAM, "Co Star"), (TEAM, "Side Kick")))
+    [usage] = [n for n in p.notes if n.startswith("usage")]
+    assert p.usage == pytest.approx(1 + h.USAGE_CAP) and "capped" in usage and "strongest of 2" in usage
+
+
+def test_a_role_change_weighs_recent_form_equal_to_h2h():
+    games = [line(g.event_id, g.date, 30, 30.0, opp="XXX") for g in RECENT]        # 1.0/min now
+    games += [line(f"h{i}", f"2025-0{i + 1}-10T23:00Z", 12, 30.0, season=2025) for i in range(4)]  # 0.4/min then
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(4)}, line_=25.5)
+    assert any(n.startswith("role change") for n in p.notes)
+    assert p.rate == pytest.approx((p.h2h_rate + p.recent_rate) / 2)              # equal weight, not 1 extra game
+
+
+def test_a_projection_far_from_the_line_gets_no_call():
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 4, 30.0) for i in range(5)]   # projecting ~6 at 20.5
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)})
+    assert p.side is None and any("from the line 20.5" in n for n in p.notes)
+    small = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 0, 30.0) for i in range(5)],
+                    {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}, stat="steals", line_=0.5)
+    assert not any("from the line" in n for n in small.notes)                     # a 0.5 line: guard doesn't apply
+
+
+def test_probabilities_are_widened_and_capped():
+    tight = h.prob_over(5.0, 8.5)[0]
+    wide = h.prob_over(5.0, 8.5, var=5.0 * 3)[0]
+    assert wide > tight                                                           # more variance, fatter tail
+    over4, push4 = h.prob_over(5.0, 4.0, var=12.0)
+    assert over4 + push4 == pytest.approx(h.prob_over(5.0, 3.5, var=12.0)[0])   # P(X>4) + P(X=4) = P(X>3.5)
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 27) for i in range(9)]
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(9)}, line_=16.5)
+    assert p.p_over <= h.MAX_CONF
+
+
+def test_negative_binomial_matches_its_closed_form():
+    mu, var = 4.0, 10.0
+    r = mu * mu / (var - mu)
+    q = mu / (r + mu)
+    pmf0 = (1 - q) ** r
+    over, push = h.prob_over(mu, 0.0, var)
+    assert push == pytest.approx(pmf0) and over == pytest.approx(1 - pmf0)
