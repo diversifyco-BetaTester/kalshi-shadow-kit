@@ -225,8 +225,9 @@ def test_status_out_means_no_prediction():
 
 def test_questionable_cuts_minutes_and_blocks_more():
     games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 27) for i in range(4)]  # 27 a game: a More at 20.5
-    healthy = predict(games)
-    q = predict(games, injuries=injured((TEAM, ME), status="Questionable"))
+    healthy = predict(games, line_=19.5)
+    q = predict(games, injuries=injured((TEAM, ME), status="Questionable"), line_=19.5)
+    assert q.p_over >= h.THRESHOLD                                                # still an Over on the numbers...
     assert healthy.side == "More" and q.exp_minutes == pytest.approx(30 * 0.85)
     assert q.side is None and any("no More" in n for n in q.notes)
 
@@ -385,3 +386,36 @@ def test_negative_binomial_matches_its_closed_form():
     pmf0 = (1 - q) ** r
     over, push = h.prob_over(mu, 0.0, var)
     assert push == pytest.approx(pmf0) and over == pytest.approx(1 - pmf0)
+
+
+
+# --------------------------------------------------------------------------- v3 probability engine (2026-10-31)
+def test_every_projection_size_uses_the_negative_binomial():
+    mu, var = 25.0, 25.0 + 25.0 ** 2 / 7
+    r = mu * mu / (var - mu)
+    q = mu / (r + mu)
+    pmf = lambda k: math.exp(math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1) + r * math.log(1 - q) + k * math.log(q))
+    over, push = h.prob_over(mu, 24.5, var)                                       # above POISSON_MAX: no normal
+    assert push == 0 and over == pytest.approx(1 - sum(pmf(k) for k in range(25)))
+    assert h.prob_over(25.0, 24.5)[0] != pytest.approx(over)                      # no variance given: the old normal
+
+
+def test_variance_is_the_fitted_overdispersion_alone():
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 21) for i in range(5)]
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)})
+    over, push = h.prob_over(p.mu, 20.5, p.mu + p.mu ** 2 / h.NB_R["nba"])
+    assert p.p_over == pytest.approx(over / (1 - push))
+    assert p.side is None                                                         # at the line: no skew-driven Less
+
+
+def test_an_extreme_projection_is_capped_within_25_percent_of_the_line():
+    games = RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 33) for i in range(5)]  # ~31 projected at 24.5: +27%
+    p = predict(games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}, line_=24.5)
+    assert p.mu == pytest.approx(24.5 * (1 + h.PROJ_CAP)) and any("capped to" in n for n in p.notes)
+    assert not any("from the line" in n for n in p.notes)                         # 27% < 40%: capped, still a call
+    far = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 40) for i in range(5)],
+                  {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}, line_=24.5)
+    assert far.side is None and any("from the line 24.5" in n for n in far.notes)  # the no-call guard sees the raw
+    small = predict(RECENT + [line(f"h{i}", f"2026-10-1{i}T23:00Z", 3) for i in range(5)],
+                    {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)}, stat="steals", line_=0.5)
+    assert not any("capped to" in n for n in small.notes)                         # lines under 3: no cap

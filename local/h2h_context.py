@@ -33,9 +33,9 @@ Model (predict):
   5. Expected minutes: mean of his last 5 played games; a minutes restriction (first game back after a
      RESTRICT_GAP_DAYS+ absence at under RESTRICT_RATIO of his usual minutes) caps it at that game's minutes;
      Questionable / Doubtful / Day-To-Day scale it by STATUS_MINUTES. Out / IR / suspended: no prediction.
-  6. Projection mu = rate x usage x expected minutes. P(over), P(push) from a negative binomial (mu <= POISSON_MAX)
-     or a normal, with variance DISPERSION x mu (game-to-game swings) + mu^2 / (n_eff + prior) (the rate itself is
-     an estimate from a few games), capped to [1 - MAX_CONF, MAX_CONF] until graded calibration supports more.
+  6. Projection mu = rate x usage x expected minutes, capped within PROJ_CAP of the line (v3). P(over), P(push)
+     from a negative binomial at every projection size, variance mu + mu^2 / NB_R[sport] (fitted on graded
+     residuals), clamped to [1 - MAX_CONF, MAX_CONF] until graded calibration supports more.
      A side only when P(side | no push) >= threshold AND n_eff >= MIN_EFF_N.
 
 Guards added 2026-10-30 after the first live board, whose most confident calls were all model artifacts:
@@ -71,7 +71,12 @@ SUPPORTED = ("nba", "nhl")
 # Bump whenever the model's logic or constants change, so the shadow log and grading keep versions apart:
 #   v1  2026-10-30 the first engine (1f2efea..720d7b3); rows logged before versioning (no tag) are v1
 #   v2  2026-10-30 goalie, usage-cap, role-change and line-gap guards, widened/capped probabilities (4cbae41)
-MODEL_VERSION = "v2"
+#   v3  2026-10-31 negative binomial at every projection size with overdispersion fitted per sport (NB_R), and
+#                  projections capped within PROJ_CAP of the line. v2 graded worse than always-50% (Brier 0.2771
+#                  vs 0.25, 641 props, 2 slates): its projections' disagreements with the line were anti-predictive
+#                  (corr(mu - line, actual - line) = -0.20) and the raw H2H record carried no signal (-0.01).
+#                  Re-scored offline, v3 gives 0.2739: a little less wrong, still no edge over the line.
+MODEL_VERSION = "v3"
 MINUTES = {"nba": ["min:minutes"], "nhl": ["min:timeOnIcePerGame"]}
 SEASONS = 3                 # current + 2 previous
 SEASON_DECAY = 0.75         # weight per season of age
@@ -85,7 +90,13 @@ USAGE_MIN_WITH, USAGE_MIN_WITHOUT = 3, 2
 RESTRICT_RATIO, RESTRICT_GAP_DAYS = 0.75, 7
 STATUS_MINUTES = {"questionable": 0.85, "day-to-day": 0.85, "doubtful": 0.6}
 GOALIE_STATS = {"goals", "assists", "points", "power play points"}
-POISSON_MAX, DISPERSION = 15.0, 1.5  # variance = DISPERSION x mu (+ rate uncertainty, see prob_over)
+POISSON_MAX, DISPERSION = 15.0, 1.5  # prob_over's defaults when no variance is given (not used by predict)
+# Negative binomial overdispersion: variance = mu + mu^2 / NB_R. Method of moments on the 641 graded v2 props
+# (2026-10-31: NBA 7.1, NHL 5.6), fitted on (actual - projection), so it already includes the projection's own
+# error: no separate rate-uncertainty term is added (that double count scored better only by pulling every
+# probability toward 50%). Smaller = more overdispersed. Refit as graded props accumulate.
+NB_R = {"nba": 7.0, "nhl": 5.5}
+PROJ_CAP = 0.25             # a projection is capped within 25% of a line of LINE_GAP_MIN+ (after the no-call check)
 MAX_CONF = 0.85             # P(over) clamped to [0.15, 0.85] until graded calibration supports more
 GOALIE_PROPS = {"saves"}    # needs the probable starter, expects a full game
 GOALIE_MINUTES = 60.0
@@ -207,13 +218,13 @@ def key_players(boxes: list[Box], team: str, exclude: str, sport: str) -> list[s
 
 
 def prob_over(mu: float, line: float, var: float | None = None) -> tuple[float, float]:
-    """(P(stat > line), P(stat == line)); the push is 0 for a half line. `var`: the variance (default: Poisson,
-    var = mu, for low projections; DISPERSION x mu above POISSON_MAX). A variance above mu makes the low-count
-    model a negative binomial with that variance."""
+    """(P(stat > line), P(stat == line)); the push is 0 for a half line. `var` above mu: a negative binomial with
+    that variance, at any projection size (predict always passes one). No `var`: Poisson up to POISSON_MAX, a
+    normal with DISPERSION x mu above it."""
     whole = abs(line % 1) < 1e-9
     if mu <= 0:
         return 0.0, 1.0 if whole and line == 0 else 0.0
-    if mu <= POISSON_MAX:
+    if mu <= POISSON_MAX or (var is not None and var > mu * (1 + 1e-9)):
         k = int(math.floor(line))
         if var is None or var <= mu * (1 + 1e-9):
             pmfs = [math.exp(-mu + i * math.log(mu) - math.lgamma(i + 1)) for i in range(k + 1)]
@@ -389,8 +400,13 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     if pred.exp_minutes is None:
         pred.notes.append("no recent minutes")
         return pred
-    pred.mu = pred.rate * pred.usage * pred.exp_minutes
-    var = DISPERSION * pred.mu + pred.mu ** 2 / (pred.n_eff + prior)  # game swings + the rate's own uncertainty
+    raw_mu = pred.rate * pred.usage * pred.exp_minutes
+    pred.mu = raw_mu
+    if line >= LINE_GAP_MIN:  # extreme projections (blowouts, minutes the model can't see) pulled toward the line
+        pred.mu = min(line * (1 + PROJ_CAP), max(line * (1 - PROJ_CAP), raw_mu))
+        if pred.mu != raw_mu:
+            pred.notes.append(f"projection {raw_mu:.1f} capped to {pred.mu:.1f} (within {PROJ_CAP:.0%} of the line)")
+    var = pred.mu + pred.mu ** 2 / NB_R[sport]  # fitted on graded residuals: includes the projection's error
     over, pred.p_push = prob_over(pred.mu, line, var)
     decided = 1 - pred.p_push
     pred.p_over = over / decided if decided > 0 else None
@@ -400,10 +416,10 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     if capped != pred.p_over:
         pred.notes.append(f"P(over) {pred.p_over:.1%} capped at {capped:.0%} until calibration supports more")
         pred.p_over = capped
-    gap = abs(pred.mu - line) / line if line >= LINE_GAP_MIN else 0.0
+    gap = abs(raw_mu - line) / line if line >= LINE_GAP_MIN else 0.0  # judged before the cap
     blocked = []  # every reason is logged, not just the first
     if gap > LINE_GAP:
-        blocked.append(f"projection {pred.mu:.1f} is {gap:.0%} from the line {line:g}: likely a role or minutes "
+        blocked.append(f"projection {raw_mu:.1f} is {gap:.0%} from the line {line:g}: likely a role or minutes "
                        f"change the model misses, no call")
     if pred.n_eff < MIN_EFF_N:
         blocked.append(f"thin H2H: effective sample {pred.n_eff:.1f} < {MIN_EFF_N:g}, no call")

@@ -53,9 +53,11 @@ def bucket(x: float, buckets: list[tuple[float, str]]) -> str:
 
 
 def predictions(path: Path | str = h2h_shadow.DB, since: float = 0.0, until: float = math.inf, sport: str | None = None,
-                first: bool = False, version: str | None = h2h_context.MODEL_VERSION) -> list[dict]:
+                first: bool = False, version: str | None = "current") -> list[dict]:
     """One row per prop (sport, player, stat, line, start) and model version: its last (or first) prediction
-    logged before the start. `version` None: every version, each graded on its own predictions."""
+    logged before the start. `version` None: every version, each graded on its own predictions; "current":
+    h2h_context.MODEL_VERSION as it is NOW (not when this module was imported)."""
+    version = h2h_context.MODEL_VERSION if version == "current" else version
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     pick, v = ("MIN(id)" if first else "MAX(id)"), h2h_shadow.version_sql(db)
@@ -146,7 +148,8 @@ def calibration_section(rows: list[dict]) -> list[str]:
     return out
 
 
-def report(rows: list[dict], first: bool = False, version: str | None = h2h_context.MODEL_VERSION) -> str:
+def report(rows: list[dict], first: bool = False, version: str | None = "current") -> str:
+    version = h2h_context.MODEL_VERSION if version == "current" else version
     status = Counter(r["result"] if r["side"] else r["over"] for r in rows)
     which = (f"model {version}" + (" (current)" if version == h2h_context.MODEL_VERSION else "") if version
              else "all model versions: " + ", ".join(sorted({r["version"] for r in rows})))
