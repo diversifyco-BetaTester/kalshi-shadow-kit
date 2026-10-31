@@ -89,9 +89,12 @@ class ShadowLog:
         self.db.execute("PRAGMA journal_mode=WAL")   # the NBA and NHL sentinels share this file
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
-        if not any(r[1] == "model_version" for r in self.db.execute("PRAGMA table_info(h2h_predictions)")):
-            self.db.execute("ALTER TABLE h2h_predictions ADD COLUMN model_version TEXT")  # existing rows: v1
-            self.db.commit()
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(h2h_predictions)")}
+        for col, typ in (("model_version", "TEXT"),       # existing rows: v1
+                         ("p_over_line", "REAL"), ("p_over_anchor", "REAL")):  # baseline arms (v3 on)
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE h2h_predictions ADD COLUMN {col} {typ}")
+        self.db.commit()
 
     def _last(self, sport: str, prop: dict):
         return self.db.execute(f"SELECT side, p_over, mu, notes_json, error, {version_sql(self.db)} FROM h2h_predictions "
@@ -116,12 +119,12 @@ class ShadowLog:
         g = (lambda k: getattr(pred, k) if pred else None)
         self.db.execute(
             "INSERT INTO h2h_predictions (ts, board_ts, sport, player, stat, line, odds_type, team, opp, start_ts, side, "
-            "p_over, p_push, mu, rate, usage, exp_minutes, n_h2h, n_eff, notes_json, games_json, error, model_version) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "p_over, p_push, mu, rate, usage, exp_minutes, n_h2h, n_eff, notes_json, games_json, error, model_version, "
+            "p_over_line, p_over_anchor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, board_ts, sport, prop["player"], prop["stat"], prop["line"], prop["odds_type"], prop["team"],
              prop["opp"], prop["start_ts"], g("side"), g("p_over"), g("p_push"), g("mu"), g("rate"), g("usage"),
              g("exp_minutes"), g("n_h2h"), g("n_eff"), notes, json.dumps(pred.games if pred else []), error or None,
-             h2h_context.MODEL_VERSION))
+             h2h_context.MODEL_VERSION, getattr(pred, "p_over_line", None), getattr(pred, "p_over_anchor", None)))
         self.db.commit()
         return True
 

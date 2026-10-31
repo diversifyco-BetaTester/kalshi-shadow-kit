@@ -97,6 +97,11 @@ POISSON_MAX, DISPERSION = 15.0, 1.5  # prob_over's defaults when no variance is 
 # probability toward 50%). Smaller = more overdispersed. Refit as graded props accumulate.
 NB_R = {"nba": 7.0, "nhl": 5.5}
 PROJ_CAP = 0.25             # a projection is capped within 25% of a line of LINE_GAP_MIN+ (after the no-call check)
+# Baseline arms, logged beside every v3 prediction for the head-to-head test (local/h2h_grade.py, decision rule):
+#   line      the PrizePicks line itself as the projection: H2H plays no part
+#   anchored  the line moved ANCHOR_K of the way toward the raw H2H projection: H2H as a small adjustment
+# Same distribution (negative binomial, NB_R) and same 15-85% clamp as v3, so only the projection differs.
+ANCHOR_K = 0.25
 MAX_CONF = 0.85             # P(over) clamped to [0.15, 0.85] until graded calibration supports more
 GOALIE_PROPS = {"saves"}    # needs the probable starter, expects a full game
 GOALIE_MINUTES = 60.0
@@ -217,6 +222,15 @@ def key_players(boxes: list[Box], team: str, exclude: str, sport: str) -> list[s
     return sorted(p for p, ms in played.items() if p != exclude and fmean(ms) >= KEY_MIN[sport])
 
 
+def arm_p(sport: str, mu: float, line: float) -> float | None:
+    """P(over | no push) for projection `mu`, the way every arm computes it: negative binomial with the sport's
+    fitted overdispersion, clamped to [1 - MAX_CONF, MAX_CONF]."""
+    over, push = prob_over(mu, line, mu + mu * mu / NB_R[sport])
+    if push >= 1:
+        return None
+    return min(MAX_CONF, max(1 - MAX_CONF, over / (1 - push)))
+
+
 def prob_over(mu: float, line: float, var: float | None = None) -> tuple[float, float]:
     """(P(stat > line), P(stat == line)); the push is 0 for a half line. `var` above mu: a negative binomial with
     that variance, at any projection size (predict always passes one). No `var`: Poisson up to POISSON_MAX, a
@@ -259,6 +273,8 @@ class Prediction:
     n_eff: float = 0.0
     notes: list[str] = field(default_factory=list)
     games: list[dict] = field(default_factory=list)  # per H2H game: date, minutes, stat, weight, mismatches
+    p_over_line: float | None = None    # baseline arm: P(over | no push) projecting the line itself
+    p_over_anchor: float | None = None  # baseline arm: the line moved ANCHOR_K toward the raw projection
 
 
 def expected_minutes(lines: list[GameLine], status: str, notes: list[str]) -> float | None:
@@ -416,6 +432,9 @@ def predict(player: str, sport: str, stat: str, line: float, team: str, opp: str
     if capped != pred.p_over:
         pred.notes.append(f"P(over) {pred.p_over:.1%} capped at {capped:.0%} until calibration supports more")
         pred.p_over = capped
+    # the baseline arms, on exactly the props v3 prices (local/h2h_grade.py compares them)
+    pred.p_over_line = arm_p(sport, line, line) if line > 0 else None
+    pred.p_over_anchor = arm_p(sport, line + ANCHOR_K * (raw_mu - line), line)
     gap = abs(raw_mu - line) / line if line >= LINE_GAP_MIN else 0.0  # judged before the cap
     blocked = []  # every reason is logged, not just the first
     if gap > LINE_GAP:

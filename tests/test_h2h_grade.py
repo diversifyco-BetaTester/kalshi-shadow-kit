@@ -171,3 +171,90 @@ def test_a_log_never_upgraded_still_grades_as_v1(tmp_path):
     assert h2h_grade.predictions(path) == []                                  # the current version has none
     [old] = h2h_grade.predictions(path, version="v1")
     assert old["player"] == "Old" and old["version"] == "v1"
+
+
+# --------------------------------------------------------------------------- the one-week arms test
+def arm_rows(n_games, slates, v3, line, anchor, over_rate=0.5, odds_type="standard"):
+    """Graded rows: n_games per slate, 4 props each; each arm's P(over) a function of the outcome y."""
+    rows = []
+    for s in range(slates):
+        for gi in range(n_games):
+            for k in range(4):
+                y = (gi * 4 + k) % 100 < over_rate * 100
+                start = START + s * 86400 + gi * 60
+                rows.append({"sport": "nba", "player": f"P{s}-{gi}-{k}", "team": f"T{gi}", "opp": f"O{gi}",
+                             "start_ts": start, "odds_type": odds_type, "over": "hit" if y else "miss",
+                             "p_over": v3(y), "p_over_line": line(y), "p_over_anchor": anchor(y)})
+    return rows
+
+
+def test_arms_need_all_three_probabilities_and_standard_props():
+    rows = arm_rows(3, 1, lambda y: .6, lambda y: .5, lambda y: .5)
+    rows[0]["p_over_line"] = None                                                 # logged before the arms existed
+    for r in rows[1:3]:
+        r["odds_type"] = "goblin"
+    text = "\n".join(h2h_grade.arms_section(rows))
+    assert f"{len(rows) - 3} graded standard props" in text
+    assert "no graded props with all three arms" in "\n".join(h2h_grade.arms_section(rows[:1]))
+
+
+def test_paired_brier_and_its_game_bootstrap():
+    rows = arm_rows(10, 1, lambda y: .7 if y else .3, lambda y: .5, lambda y: .5)  # v3 always right
+    d, lo, hi = h2h_grade.paired_brier(rows, "p_over", "p_over_line")
+    assert d == pytest.approx(0.09 - 0.25) and lo == pytest.approx(d) and hi == pytest.approx(d)  # no spread
+    again = h2h_grade.paired_brier(rows, "p_over", "p_over_line")
+    assert again == (d, lo, hi)                                                   # seeded: reproducible
+
+
+def test_the_bootstrap_resamples_games_not_props():
+    # 2 games of 40 props: one where v3 is right, one where it is wrong. By prop the evidence looks huge (80
+    # props); by game it is 2 observations and the interval must straddle 0.
+    rows = []
+    for gi, right in ((0, True), (1, False)):
+        for k in range(40):
+            y = k % 2 == 0
+            p = (.8 if y else .2) if right else (.2 if y else .8)
+            rows.append({"sport": "nba", "player": f"P{gi}{k}", "team": f"T{gi}", "opp": f"O{gi}", "start_ts": START,
+                         "odds_type": "standard", "over": "hit" if y else "miss", "p_over": p, "p_over_line": .5,
+                         "p_over_anchor": .5})
+    d, lo, hi = h2h_grade.paired_brier(rows, "p_over", "p_over_line")
+    assert lo < 0 < hi
+
+
+def test_the_decision_waits_for_seven_slates_and_300_props():
+    worse = arm_rows(5, 3, lambda y: .3 if y else .7, lambda y: .5, lambda y: .5)  # 60 props, 3 slates
+    text = "\n".join(h2h_grade.arms_section(worse))
+    assert "DECISION: not yet: 3/7 slates, 60/300 props" in text and "DROP H2H" in text
+
+
+@pytest.mark.parametrize("v3, anchor, decision", [
+    (lambda y: .65 if y else .35, lambda y: .5, "KEEP H2H as the primary factor"),
+    (lambda y: .5, lambda y: .6 if y else .4, "DROP H2H as the primary factor; use the anchored arm"),
+    (lambda y: .35 if y else .65, lambda y: .5, "DROP H2H as the primary factor; use the line alone"),
+])
+def test_the_pre_registered_rule(v3, anchor, decision):
+    rows = arm_rows(11, 7, v3, lambda y: .5, anchor)                              # 7 slates, 308 props
+    text = "\n".join(h2h_grade.arms_section(rows))
+    assert f"DECISION (rule fixed 2026-10-31): {decision}" in text
+
+
+def test_slates_are_us_eastern_dates_not_utc():
+    late = START - START % 86400 + 86400 + 2 * 3600                              # 02:00 UTC = the evening before ET
+    early = late - 6 * 3600                                                      # 20:00 UTC the same ET day
+    rows = [{"start_ts": t} for t in (early, late)]
+    assert h2h_grade.slate(rows[0]) == h2h_grade.slate(rows[1])
+
+
+def test_the_engine_logs_both_baseline_arms(tmp_path):
+    from tests.test_h2h_context import RECENT, box, line as gl, ME
+    games = RECENT + [gl(f"h{i}", f"2026-10-1{i}T23:00Z", 30) for i in range(5)]
+    p = h2h_context.predict(ME, "nba", "points", 20.5, "LAL", "OKC", games, {f"h{i}": box(f"h{i}", {ME: 30}) for i in range(5)})
+    raw = p.rate * p.usage * p.exp_minutes
+    assert p.p_over_line == pytest.approx(h2h_context.arm_p("nba", 20.5, 20.5))
+    assert p.p_over_anchor == pytest.approx(h2h_context.arm_p("nba", 20.5 + h2h_context.ANCHOR_K * (raw - 20.5), 20.5))
+    assert p.p_over_line < p.p_over_anchor < p.p_over                            # H2H leans over: anchored in between
+    log = h2h_shadow.ShadowLog(tmp_path / "s.sqlite3")
+    log.record("nba", {"player": ME, "stat": "points", "line": 20.5, "team": "LAL", "opp": "OKC", "start_ts": START,
+                       "odds_type": "standard"}, p, 1.0, START - 60)
+    assert log.db.execute("SELECT p_over_line, p_over_anchor FROM h2h_predictions").fetchone() == \
+        (pytest.approx(p.p_over_line), pytest.approx(p.p_over_anchor))

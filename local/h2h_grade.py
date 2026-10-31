@@ -28,6 +28,20 @@ Report:
   python3 -m local.h2h_grade --grade      # first fetch outcomes for finished props from ESPN, then report
   python3 -m local.h2h_grade --grade --since 2026-11-01 --sport nba
   python3 -m local.h2h_grade --all-versions          # every model version, side by side
+
+THE ONE-WEEK TEST (v3 vs line-anchored baselines; fixed 2026-10-31, BEFORE any v3 prediction existed)
+  Every v3 prediction logs two baseline arms on the same prop (h2h_context ANCHOR_K): "line" (the PrizePicks
+  line as the projection, H2H plays no part) and "anchored" (the line moved 25% toward the H2H projection).
+  The arms differ only in their projection: same distribution, same clamp, same props, same outcomes.
+  Compared on standard props only (goblin/demon lines aren't the market's line), by Brier score, paired per
+  prop, with a 95% interval from a bootstrap over GAMES (props in one game move together: resampling props
+  would overstate the evidence).
+  Decision, once there are DECIDE_MIN_SLATES slates and DECIDE_MIN_PROPS graded props:
+    KEEP H2H as the primary factor  only if v3 beats the line arm: the whole interval of
+                                    Brier(v3) - Brier(line) is below 0
+    otherwise DROP it, and          use the anchored arm if it beats the line the same way (H2H as a small
+                                    adjustment), else the line alone (H2H adds nothing measurable)
+  The rule is applied as written: no peeking-and-moving the thresholds.
 """
 from __future__ import annotations
 
@@ -40,11 +54,17 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import random
+
 from local import backtest, h2h_context, h2h_shadow, optimizer
+from local import prize_picks_ev_scraper as scanner
 
 BREAKEVEN = optimizer.breakeven(5)  # ~54.25%: the 5-pick Flex per-leg break-even (6-pick is ~54.21%)
 CONF_BUCKETS = [(0.60, "56-60%"), (0.65, "60-65%"), (0.75, "65-75%"), (1.01, "75%+")]
 NEFF_BUCKETS = [(3, "n_eff 2-3"), (5, "n_eff 3-5"), (float("inf"), "n_eff 5+")]
+ARMS = (("v3 (H2H primary)", "p_over"), ("line", "p_over_line"), ("anchored", "p_over_anchor"))
+DECIDE_MIN_SLATES, DECIDE_MIN_PROPS = 7, 300
+BOOT_N, BOOT_SEED = 2000, 20261031
 CAL_BUCKETS = [(0.2, "0-20%"), (0.35, "20-35%"), (0.5, "35-50%"), (0.65, "50-65%"), (0.8, "65-80%"), (1.01, "80-100%")]
 
 
@@ -148,6 +168,72 @@ def calibration_section(rows: list[dict]) -> list[str]:
     return out
 
 
+def game_key(r: dict) -> tuple:
+    return r["sport"], round(r["start_ts"]), tuple(sorted((r["team"] or "", r["opp"] or "")))
+
+
+def slate(r: dict) -> str:
+    return datetime.fromtimestamp(r["start_ts"], scanner.EASTERN).strftime("%Y-%m-%d")
+
+
+def paired_brier(rows: list[dict], a: str, b: str, n: int = BOOT_N, seed: int = BOOT_SEED) -> tuple[float, float, float]:
+    """Mean of Brier(a) - Brier(b) per prop (< 0: `a` better), with a 95% interval from a bootstrap over games."""
+    games: dict[tuple, list[float]] = {}
+    for r in rows:
+        y = 1.0 if r["over"] == "hit" else 0.0
+        games.setdefault(game_key(r), []).append((r[a] - y) ** 2 - (r[b] - y) ** 2)
+    keys = sorted(games)
+    point = sum(sum(v) for v in games.values()) / sum(len(v) for v in games.values())
+    rng, stats = random.Random(seed), []
+    for _ in range(n):
+        pick = [games[keys[rng.randrange(len(keys))]] for _ in keys]
+        stats.append(sum(sum(v) for v in pick) / sum(len(v) for v in pick))
+    stats.sort()
+    return point, stats[int(0.025 * n)], stats[int(0.975 * n) - 1]
+
+
+def arms_section(rows: list[dict]) -> list[str]:
+    """The one-week test (module docstring): v3 against the line-anchored baselines, and the decision."""
+    cmp = [r for r in rows if r["over"] in ("hit", "miss") and (r["odds_type"] or "standard") == "standard"
+           and all(r.get(k) is not None for _, k in ARMS)]
+    if not cmp:
+        return ["\nARMS (v3 vs line-anchored baselines): no graded props with all three arms yet"]
+    slates, games = sorted({slate(r) for r in cmp}), {game_key(r) for r in cmp}
+    out = [f"\nARMS: v3 vs line-anchored baselines · {len(cmp)} graded standard props · {len(games)} games · "
+           f"{len(slates)} slate(s) {slates[0]}..{slates[-1]}"]
+    for name, k in ARMS:
+        brier = sum((r[k] - (r["over"] == "hit")) ** 2 for r in cmp) / len(cmp)
+        calls = [r for r in cmp if max(r[k], 1 - r[k]) >= h2h_context.THRESHOLD]
+        ok = sum((r["over"] == "hit") == (r[k] >= 0.5) for r in calls)
+        more = sum(r[k] >= 0.5 for r in calls)
+        rec = (f"calls n={len(calls):<4} hit {ok / len(calls):5.1%} [95% {ci_text(ok, len(calls))}] "
+               f"({more} More / {len(calls) - more} Less)" if calls else "no calls")
+        out.append(f"  {name:18} Brier {brier:.4f}   {rec}")
+    out.append(f"  {'always 50%':18} Brier 0.2500")
+    out.append(" paired Brier difference, per prop (< 0: the first is better), 95% bootstrap over games:")
+    diffs = {}
+    for a, b in (("p_over", "p_over_line"), ("p_over_anchor", "p_over_line"), ("p_over", "p_over_anchor")):
+        d = diffs[(a, b)] = paired_brier(cmp, a, b)
+        name = lambda k: next(n for n, kk in ARMS if kk == k)
+        verdict = "better" if d[2] < 0 else "worse" if d[1] > 0 else "no clear difference"
+        out.append(f"  {name(a):>18} - {name(b):<18} {d[0]:+.4f}  [{d[1]:+.4f}, {d[2]:+.4f}]  {verdict}")
+    v3_wins, anchor_wins = diffs[("p_over", "p_over_line")][2] < 0, diffs[("p_over_anchor", "p_over_line")][2] < 0
+    decision = ("KEEP H2H as the primary factor (v3 beats the line)" if v3_wins else
+                "DROP H2H as the primary factor; use the anchored arm (H2H as a small adjustment beats the line)"
+                if anchor_wins else "DROP H2H as the primary factor; use the line alone (H2H adds nothing measurable)")
+    if len(slates) < DECIDE_MIN_SLATES or len(cmp) < DECIDE_MIN_PROPS:
+        out.append(f" DECISION: not yet: {len(slates)}/{DECIDE_MIN_SLATES} slates, {len(cmp)}/{DECIDE_MIN_PROPS} "
+                   f"props. On the data so far the rule would say: {decision}")
+    else:
+        out.append(f" DECISION (rule fixed 2026-10-31): {decision}")
+    return out
+
+
+def ci_text(k: int, n: int) -> str:
+    lo, hi = wilson(k, n)
+    return f"{lo:.0%}-{hi:.0%}"
+
+
 def report(rows: list[dict], first: bool = False, version: str | None = "current") -> str:
     version = h2h_context.MODEL_VERSION if version == "current" else version
     status = Counter(r["result"] if r["side"] else r["over"] for r in rows)
@@ -158,7 +244,7 @@ def report(rows: list[dict], first: bool = False, version: str | None = "current
            "outcomes: " + (", ".join(f"{k} {v}" for k, v in status.most_common()) or "none")]
     if status.get("ungraded"):
         out.append("  (ungraded props: run with --grade to fetch their results)")
-    return "\n".join(out + calls_section(rows) + calibration_section(rows))
+    return "\n".join(out + calls_section(rows) + calibration_section(rows) + arms_section(rows))
 
 
 def main() -> None:
