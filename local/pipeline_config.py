@@ -59,6 +59,10 @@ key by key. Payout tables are {legs: {hits: multiplier}} as JSON objects (string
                               was possible (budget, reserve, no odds key)
   stat_feature                log a stats-vs-market gap (local/stat_research.py) on every chosen leg, in the
                               background; a FEATURE for the backtest slices, never a veto
+  signals.line_gap            log the PrizePicks-vs-books MAIN line gap on legs the books left unpriced, from the
+                              market already cached (Build 3, coverage only; no request, no CLV, never a "middle")
+  signals.shadow_promo        price the board's demon/goblin legs from Kalshi only (0 credits) into the
+                              shadow_prices table (Build 4); they never join legs, slips or the pool
   staking.kelly / unit_pct    quarter Kelly, 1u = 1% of bankroll
   staking.max_units           cap (2.0u): never stake more, whatever Kelly says
   staking.min_units           a slip whose Kelly stake is below this (0.5u) is...
@@ -95,6 +99,8 @@ DEFAULTS = {
     "stat_feature": {"enabled": True, "games": 10, "min_games": 5},
     "odds_budget": {"shares": {"nfl": 0.5, "other": 0.5}},
     "staking": {"kelly": 0.25, "unit_pct": 0.01, "min_units": 0.5, "max_units": 2.0, "below_min": "skip"},
+    # logged-only signals (local/signals.py, 2026-11-04): toggles for LOGGING, never for selection
+    "signals": {"line_gap": True, "shadow_promo": True},
 }
 
 

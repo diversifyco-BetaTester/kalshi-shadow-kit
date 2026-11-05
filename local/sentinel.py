@@ -93,9 +93,10 @@ from dotenv import load_dotenv
 
 from local import correlation, enricher, ev_pool, fetch_odds, injury_guard, integrity, ledger, optimizer, pipeline_config, snapshots
 from local import h2h_context, h2h_shadow, stat_research
+from local import signals  # logged-only (Builds 1-5): called after slips are claimed, and for the send order
 from local import steam as steam_mod
 from local import prize_picks_ev_scraper as scanner
-from local.parse_board import SPORTS, board_path, lines_path, load_board, write_csv
+from local.parse_board import SPORTS, board_path, lines_path, load_board, promo_rows, write_csv
 from ops.telegram import send_async
 
 STALE_AFTER_MIN = 30  # PrizePicks moves lines; say so when the pasted board is older than this
@@ -337,12 +338,15 @@ def payout_note(kind: str, n: int, stacked: bool) -> str:
 
 
 def alert_text(entry: tuple, sport: str, board_age_min: float, now: float, units: float,
-               research: dict | None = None, status: dict | None = None) -> str:
+               research: dict | None = None, status: dict | None = None, display: dict | None = None) -> str:
     """The Telegram card, laid out for entering the slip by hand: stake at top and bottom; legs grouped
     by sport (in PrizePicks' tab order) and game time; each player's name in monospace (one tap copies it
     for the PrizePicks search); stat | line | MORE/LESS; the injury/starter badge and ESPN research;
     the win probability and where it came from; the payout table last.
-    `research`: {id(leg): enricher note}; `status`: {id(leg): injury_guard reason}."""
+    `research`: {id(leg): enricher note}; `status`: {id(leg): injury_guard reason}; `display`: {id(leg): the
+    leg's LOGGED display record (slip_legs.display_json, signals.display_record)}: when given, each leg gets one
+    more line (signals.display_line: fair prob next to the raw per-book prices, price age, source count,
+    integrity flags; "not logged" when the record is missing). Nothing on it is computed here."""
     ev, kind, combo, stacks = entry
     sports = [s.upper() for s in BOARD_ORDER if any(l.sport == s for l in combo)] or [sport.upper()]
     stake = f"💵 <b>STAKE {units:.1f}u</b>"
@@ -370,6 +374,8 @@ def alert_text(entry: tuple, sport: str, board_age_min: float, now: float, units
         raw = l.raw_pick
         shaded = f" (market {raw[1]:.1%}, shaded)" if raw and raw[1] != l.pick[1] else ""
         lines.append(f"   📈 {l.pick[1]:.1%}{shaded}{push}" + (f" · {html.escape(tag)}" if tag else ""))
+        if display is not None:
+            lines.append(html.escape(signals.display_line(display.get(id(l))), quote=False))
     lines += [RULE, stake + " · " + payout_note(kind, len(combo), bool(stacks))]
     if board_age_min > STALE_AFTER_MIN:
         lines.append(f"⚠ Board captured {board_age_min:.0f} min ago: check each line in the app.")
@@ -470,6 +476,30 @@ def reevaluate(a, e: tuple) -> tuple[tuple | None, str]:
 
 
 async def jit_refresh(a, e: tuple, touched: set) -> tuple[tuple | None, str]:
+    """_jit_refresh, plus Build 2/5 LOGGING around it (signals.jit_event: every leg it re-priced, and every
+    watchlisted leg that came through, before and after). The logging never changes the result, spends
+    nothing and never raises; events are written by the cycle's snapshot block."""
+    combo = list(e[2])
+    try:
+        before = {id(l): signals.observation(l) for l in combo}
+    except Exception:  # noqa: BLE001
+        before = None
+    seen = set(touched)
+    result = await _jit_refresh(a, e, touched)
+    if before is not None:
+        try:
+            refreshed, watch, at = set(touched) - seen, getattr(a, "targeted", None), time.time()
+            events = a.__dict__.setdefault("jit_events", [])
+            for l in combo:
+                if id(l) in refreshed or signals.listed(l, watch):
+                    events.append(signals.jit_event(l, before[id(l)], signals.observation(l), id(l) in refreshed,
+                                                    watch, getattr(a, "cycle_now", None), at))
+        except Exception as err:  # noqa: BLE001
+            print(f"{time.strftime('%H:%M:%S')} JIT event log failed: {err!r}")
+    return result
+
+
+async def _jit_refresh(a, e: tuple, touched: set) -> tuple[tuple | None, str]:
     """Just before a slip is claimed: re-price its books legs whose price is older than
     jit_refresh.max_age_s from a targeted refresh, then re-evaluate it. (entry or None, log note).
     `touched` collects legs re-priced this cycle, so a later slip sharing one is re-evaluated too."""
@@ -579,8 +609,38 @@ def waiting_for_board(a, now: float) -> bool:
     return True
 
 
+def signal_slip_records(a, e: tuple, built: float, board_ts: float, has_board: bool, display: bool) -> dict:
+    """record_slip's logged-only extras (local/signals.py): per-leg display (Build 1) and meta (Builds 4/5),
+    per-slip meta (kelly_growth, entry type, payout version). {} if anything fails: never blocks logging."""
+    try:
+        watch = getattr(a, "targeted", None)
+        out = {"leg_meta": {id(l): signals.leg_meta(l, board_ts, has_board, watch) for l in e[2]},
+               "slip_meta": signals.slip_meta(e)}
+        if display:
+            out["display"] = {id(l): signals.display_record(l, built) for l in e[2]}
+        return out
+    except Exception as err:  # noqa: BLE001
+        print(f"{time.strftime('%H:%M:%S')} signal records failed: {err!r}")
+        return {}
+
+
+def signal_cycle_records(a, legs, good, eligible, fresh) -> tuple[list | None, dict | None]:
+    """The cycle row's logged-only extras: Build 3 line-gap records, Build 5 watchlist coverage."""
+    try:
+        gaps = [l.line_gap for l in legs if getattr(l, "line_gap", None)]
+        chosen = [l for e in fresh for l in e[2]]
+        wcov = signals.watch_coverage(getattr(a, "targeted", None), legs, good, eligible, chosen,
+                                      a.__dict__.get("jit_events", []))
+        return gaps, wcov
+    except Exception as err:  # noqa: BLE001
+        print(f"{time.strftime('%H:%M:%S')} signal cycle records failed: {err!r}")
+        return None, None
+
+
 async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> None:
     now = time.time()
+    a.cycle_now = now  # signals: JIT events are matched to this cycle's logged slips
+    a.__dict__.pop("jit_events", None)
     if waiting_for_board(a, now):
         heartbeat(a, now, state="waiting for first board")
         return
@@ -610,6 +670,14 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
     for q in quotes:
         q.detail = {**(q.detail or {}), "fetched_ts": read_ts}
     scanner.attach(legs, quotes)
+    shadow = []  # Build 4: demon/goblin board legs, Kalshi-only, 0 credits; never in legs/good/eligible/pool
+    if pipeline_config.CONFIG.get("signals", {}).get("shadow_promo") and getattr(a, "shadow_rows", None):
+        try:
+            shadow = signals.shadow_legs(a.shadow_rows, a.sport, now)
+            scanner.attach(shadow, quotes)
+        except Exception as err:  # noqa: BLE001 — shadow pricing must never stop the live cycle
+            print(f"{time.strftime('%H:%M:%S')} shadow promo pricing failed: {err!r}")
+            shadow = []
     by_books = 0
     if a.odds:
         # Kalshi first when its book is liquid; otherwise (no market, wide spread, or only interpolated
@@ -694,6 +762,7 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
     heartbeat(a, now, state="ok", legs=len(legs), priced=sum(bool(l.quotes) for l in legs), good=len(good),
               slips=len(entries), new=len(fresh), board_age_min=round(board_age, 1), whole_dropped=whole_dropped)
     snaps = getattr(a, "snapshots", None)
+    logged_sid: dict[int, str | None] = {}  # id(entry) -> its slip_legs id (Build 1 reads the alert values back)
     if snaps is not None and a.flex:
         try:
             paper = optimizer.build(eligible + pooled)  # paper mode: logged, never sent
@@ -704,21 +773,31 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
                 c[0] += 1
                 c[1] += bool(l.quotes) and not l.push_unpriced  # a whole line counts once its push is priced
             built = time.time()  # price ages are measured here, when the slips were built and logged
-            cid = snaps.cycle(now, board.stat().st_mtime if board.exists() else 0,
+            board_ts = board.stat().st_mtime if board.exists() else 0
+            gaps, wcov = signal_cycle_records(a, legs, good, eligible, fresh)  # logged only
+            cid = snaps.cycle(now, board_ts,
                               {"legs": len(legs), "priced": sum(bool(l.quotes) for l in legs), "good": len(good),
                                "whole_dropped": whole_dropped},
                               [snapshots.slip_summary(e, id(e) in fresh_ids, stake_units(e, a.kelly, a.unit_pct))
                                for e in entries[:10]],
                               snapshots.paper_summary(paper),
-                              eligible=[snapshots.leg_ref(l, built) for l in eligible + pooled], coverage=coverage)
+                              eligible=[snapshots.leg_ref(l, built) for l in eligible + pooled], coverage=coverage,
+                              line_gap=gaps, watchlist=wcov)
             chosen = []  # (slip id, legs) recorded this cycle: the stats feature is logged for these
+            try:  # signals only: a failure here must not skip the existing slip writes below
+                has_board = snaps.has_board(board_ts) if board_ts else False
+            except sqlite3.Error:
+                has_board = False
             for e in fresh:  # CLV: the live builder's chosen (sent) slips
-                sid = snaps.record_slip("live", cid, now, e[2], e[0], True, stake_units(e, a.kelly, a.unit_pct), age_at=built)
+                sid = snaps.record_slip("live", cid, now, e[2], e[0], True, stake_units(e, a.kelly, a.unit_pct), age_at=built,
+                                        **signal_slip_records(a, e, built, board_ts, has_board, display=True))
                 chosen.append((sid, list(e[2])))
+                logged_sid[id(e)] = sid
             if paper.chosen is not None:
                 pe = (paper.chosen.stats.ev - 1, "flex", paper.chosen.legs, [])
                 sid = snaps.record_slip("paper", cid, now, paper.chosen.legs, pe[0], False,
-                                        stake_units(pe, a.kelly, a.unit_pct), age_at=built)
+                                        stake_units(pe, a.kelly, a.unit_pct), age_at=built,
+                                        **signal_slip_records(a, pe, built, board_ts, has_board, display=False))
                 if sid:
                     chosen.append((sid, list(paper.chosen.legs)))
             if chosen and getattr(a, "stat_feature", False) and pipeline_config.CONFIG["stat_feature"]["enabled"]:
@@ -729,6 +808,14 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
             snaps.resolve_closes(now)
         except (sqlite3.Error, OSError, ValueError) as err:  # logging must never stop the alerts
             print(f"{time.strftime('%H:%M:%S')} snapshot write failed: {err!r}")
+        try:  # logged-only signals, after (and apart from) every existing write
+            if a.__dict__.get("jit_events"):
+                snaps.record_jit_events(a.jit_events)
+            if shadow:
+                snaps.shadow_prices(now, shadow, board.stat().st_mtime if board.exists() else None, age_at=time.time())
+        except Exception as err:  # noqa: BLE001
+            print(f"{time.strftime('%H:%M:%S')} signal log failed: {err!r}")
+    a.__dict__.pop("jit_events", None)
     print(f"{time.strftime('%H:%M:%S')} {sum(bool(l.quotes) for l in legs)}/{len(legs)} standard legs priced, "
           f"{started} dropped (started or within {scanner.START_BUFFER_MIN} min), {len(good)} >= {floor:.1%}"
           + (f" (+{whole} whole-number lines left out: push risk)" if whole else "")
@@ -743,14 +830,27 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
           + (f", {sum(1 for l in good if leg_key(l) in cooled)} legs cooling down" if cooled else "")
           + (f" | {by_books} priced by sportsbooks" if a.odds else "")
           + (f" | unpriced (no Kalshi market or book line for that game day): " + ", ".join(f"{s} ({n})" for s, n in unpriced.most_common()) if unpriced else ""))
-    for e in fresh:
+    logged = {}
+    if snaps is not None:
+        for e in fresh:
+            try:
+                logged[id(e)] = snaps.slip_records(logged_sid.get(id(e)))
+            except (sqlite3.Error, ValueError) as err:
+                print(f"{time.strftime('%H:%M:%S')} could not read logged slip: {err!r}")
+    try:  # Build 1: send order by the LOGGED kelly_growth; stable, ties keep the builder's EV order
+        order = signals.send_order(fresh, lambda e: signals.value((logged.get(id(e)) or {}).get("slip"), "kelly_growth"))
+    except Exception:  # noqa: BLE001
+        order = list(fresh)
+    for e in order:
         units = stake_units(e, a.kelly, a.unit_pct)
         try:
             research = await enricher.enrich_legs(list(e[2])) if a.research else None
             status = None
             if getattr(a, "injury_guard", False):  # cached feeds: re-checking the slip's legs here is free
                 status = {k: reason for k, (_, reason) in (await injury_guard.verify_legs(list(e[2]))).items()}
-            msg = alert_text(e, a.sport, board_age, now, units, research, status)
+            recs = (logged.get(id(e)) or {}).get("legs", {})
+            display = {id(l): (recs.get((l.player, l.stat, float(l.line))) or {}).get("display") for l in e[2]}
+            msg = alert_text(e, a.sport, board_age, now, units, research, status, display)
             print(msg)
             status = ("sent" if await send_async(msg, chat_id=chat_id) else "failed") if chat_id else "terminal"
         except Exception as err:  # noqa: BLE001 — one slip's alert failing must not strand its claimed legs
@@ -833,8 +933,19 @@ async def main() -> None:
     a.board_info = {}
     a.h2h = (h2h_shadow.BoardRunner(a.sport) if a.h2h_shadow and a.sport in h2h_context.SUPPORTED else None)
 
+    a.targeted = signals.load_targeted()  # Build 5: tags only (None: no local/targeted_props.json)
+    for n in (a.targeted or {}).get("notes", []):
+        print(f"{time.strftime('%H:%M:%S')} watchlist: {n}")
+    a.shadow_rows = []
+
     def on_board(feed, board_ts, rows, bad):
         a.board_info = {"board_ts": board_ts}  # whole lines now reach pricing; the cycle counts unpriced ones
+        if pipeline_config.CONFIG.get("signals", {}).get("shadow_promo") and Path(feed).suffix == ".json":
+            try:  # Build 4 shadow: demon/goblin rows, never written to the lines CSV
+                a.shadow_rows = promo_rows(json.loads(Path(feed).read_text()), a.sport)
+            except (OSError, ValueError) as err:
+                print(f"{time.strftime('%H:%M:%S')} shadow promo rows not read: {err!r}")
+                a.shadow_rows = []
         if a.snapshots is not None and not a.snapshots.has_board(board_ts):
             captured, props = snapshots.load_board_props(feed, a.sport)
             a.snapshots.board(board_ts, captured, props)
