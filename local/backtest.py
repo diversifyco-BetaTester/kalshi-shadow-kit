@@ -699,6 +699,8 @@ def signal_lines(recs: list[dict], histories: dict[str, History], outcomes: "Out
            " " + LEG_DISTINCT_NOTE]
     out.append("\n BUILD 2 · prob_delta at the JIT refresh (current fair prob - last DISTINCT earlier price, side taken)")
     out.append(" " + snapshots.CLOSING_WARNING)
+    out.append(f" floor: when prev_from is price_log, moves under {snapshots.CHANGE * 100:g} pts since the last logged row are "
+               "unobservable (never written); when prev_from is pre_refresh_quote there is no such floor")
     jd = lambda r, name: (signals.value(r["jit"], name) if r.get("jit") else None)
     signal_block(out, "direction", recs,
                  lambda r: "no JIT refresh logged" if not r.get("jit") else

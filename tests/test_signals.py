@@ -290,6 +290,23 @@ def test_close_reasons_open_missing_stale_same_fetch_and_ok(tmp_path):
     assert "same fetch as entry 1" in signals.quality_line([{"close_reason": "same_fetch"}, {"close_reason": "ok"}])
 
 
+def test_a_close_read_for_another_team_or_game_is_a_mismatch_and_left_out_of_clv(tmp_path):
+    t0 = START_TS - 3 * 3600
+    entry = books_priced("Mis", 0.58, t0 - 10, [BOOK_REC("draftkings", 1.7, 2.2)])          # game "HMis v AMis"
+    other = books_priced("Mis", 0.62, START_TS - 310, [BOOK_REC("draftkings", 1.6, 2.4)], game="ZZZ v YYY")
+    path = slip_db(tmp_path, [[entry]], t0, [(START_TS - 300, [other])])                    # same series, other game
+    h = backtest.History(path, "nhl")
+    e = backtest.LegEntry("nhl", "Mis", "points", 0.5, "More", 0.58, "books", START_TS, "HMis", "HMis v AMis")
+    assert h.read_at(backtest.series_key("Mis", "points", 0.5, "books", START_TS), START_TS).game == "ZZZ v YYY"
+    assert backtest.close_reason(e, t0, h, START_TS + 60) == "mismatch"
+    recs = backtest.leg_records(backtest.live_slips(h), {"nhl": h}, START_TS + 60)
+    assert [r["close_reason"] for r in recs] == ["mismatch"]
+    out = "\n".join(backtest.signal_lines(recs, {"nhl": h}, backtest.Outcomes(tmp_path / "o.sqlite3"), START_TS + 60))
+    block = out.split("by direction")[1].split("by book composition")[0].splitlines()
+    assert "eligible 1, usable 0" in block[1] and "market mismatch 1" in block[1] and "excluded 1 (mismatch 1)" in block[1]
+    assert block[2].strip() == "CLV n=0"                                                    # never counted as CLV
+
+
 def test_every_clv_report_carries_the_closing_warning(tmp_path, monkeypatch):
     from tests.test_backtest import run_cycles
     db = run_cycles(tmp_path, monkeypatch)
