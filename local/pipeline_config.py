@@ -63,6 +63,12 @@ key by key. Payout tables are {legs: {hits: multiplier}} as JSON objects (string
                               market already cached (Build 3, coverage only; no request, no CLV, never a "middle")
   signals.shadow_promo        price the board's demon/goblin legs from Kalshi only (0 credits) into the
                               shadow_prices table (Build 4); they never join legs, slips or the pool
+  signals.propline_shadow     price the board's in-window legs from PropLine (local/propline_shadow.py) into the
+                              propline_prices table, after each cycle, in the background; never a live price.
+                              OFF by default (needs PROPLINE_API_KEY in .env and a separately approved launch)
+  propline                    that shadow's budget and cadence: daily_cap 500 / stop_at 475 requests per UTC day
+                              (PropLine resets at 00:00 UTC), shares by sport, close_share kept for close reads,
+                              sweep_min 15 (each event re-read at most this often), close_window_min 20
   staking.kelly / unit_pct    quarter Kelly, 1u = 1% of bankroll
   staking.max_units           cap (2.0u): never stake more, whatever Kelly says
   staking.min_units           a slip whose Kelly stake is below this (0.5u) is...
@@ -100,7 +106,13 @@ DEFAULTS = {
     "odds_budget": {"shares": {"nfl": 0.5, "other": 0.5}},
     "staking": {"kelly": 0.25, "unit_pct": 0.01, "min_units": 0.5, "max_units": 2.0, "below_min": "skip"},
     # logged-only signals (local/signals.py, 2026-11-04): toggles for LOGGING, never for selection
-    "signals": {"line_gap": True, "shadow_promo": True},
+    "signals": {"line_gap": True, "shadow_promo": True, "propline_shadow": False},
+    # PropLine shadow (local/propline_shadow.py, 2026-11-06): logged only, OFF until its launch is approved. A free key
+    # allows 1,000 requests a day; this caps at 500 and stops at 475, split by sport, the last 15% of each share kept
+    # for close reads. The day is PropLine's: it resets at 00:00 UTC (16:00 PT in winter).
+    "propline": {"daily_cap": 500, "stop_at": 475, "shares": {"nba": 0.5, "nhl": 0.5}, "close_share": 0.15,
+                 "sweep_min": 15, "close_window_min": 20, "close_min_gap_min": 5, "events_ttl_min": 60,
+                 "timeout_s": 10, "window_h": 3},
 }
 
 

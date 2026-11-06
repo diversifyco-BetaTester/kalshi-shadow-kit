@@ -32,6 +32,7 @@ import argparse
 import bisect
 import csv
 import json
+import math
 import re
 import sqlite3
 import statistics
@@ -137,6 +138,17 @@ class History:
             cols_s = ("ts", "sport", "player", "stat", "line", "odds_type", "side", "team", "game", "start_ts", "p_fair",
                       "pricing_json", "calc_version")
             self.shadow = [dict(zip(cols_s, r)) for r in con.execute(f"SELECT {', '.join(cols_s)} FROM shadow_prices ORDER BY ts")]
+        # PropLine shadow (local/propline_shadow.py): every read and no-read row, and each sweep. Absent in older files.
+        self.propline: list[dict] = []
+        self.propline_sweeps: list[dict] = []
+        if "propline_prices" in tables:
+            cols_p = ("ts", "sport", "player", "stat", "line", "team", "game", "start_ts", "event_id", "read_kind",
+                      "fetched_ts", "p_live", "p_shin", "p_sharp", "n_books", "unpriced_reason", "presence_json", "ages_json")
+            self.propline = [dict(zip(cols_p, r)) for r in
+                             con.execute(f"SELECT {', '.join(cols_p)} FROM propline_prices ORDER BY ts, id")]
+        if "propline_sweeps" in tables:
+            self.propline_sweeps = [{"ts": ts, "sport": sp, "requests": n, **json.loads(js or "{}")} for ts, sp, n, js in
+                                    con.execute("SELECT ts, sport, requests, sweep_json FROM propline_sweeps ORDER BY ts")]
         self.line_gaps, self.watch_cov = [], []
         if "line_gap_json" in ccols:
             for ts, lg, wc in con.execute("SELECT ts, line_gap_json, watchlist_json FROM cycles ORDER BY ts"):
@@ -792,6 +804,255 @@ def shadow_lines(histories: dict[str, History], outcomes: "Outcomes", now: float
     return out
 
 
+# --------------------------------------------------------------------------- PropLine shadow (logged only)
+PL_FAIRS = (("p_live", "PropLine live method"), ("p_shin", "PropLine Shin"), ("p_sharp", "PropLine sharp-weighted"))
+
+
+def pl_close(rows: list[dict], entry: dict | None, start: float | None, now: float, field: str = "p_live") -> tuple[str, dict | None]:
+    """Close of one distinct PropLine leg: the last READ (with a value in `field`) at or before the start.
+    open | missing | stale (> 30 min before start) | same_fetch (the entry read itself) | mismatch (another event
+    or team) | ok."""
+    if not start or start > now:
+        return "open", None
+    reads = [r for r in rows if r["ts"] <= start and r[field] is not None]
+    if not reads or entry is None:
+        return "missing", None
+    close = reads[-1]
+    if start - close["ts"] > snapshots.STALE_CLOSE_S:
+        return "stale", close
+    if (close["event_id"] and entry["event_id"] and close["event_id"] != entry["event_id"]) or \
+            (close["team"] and entry["team"] and close["team"] != entry["team"]):
+        return "mismatch", close
+    if close is entry or (close["fetched_ts"] is not None and close["fetched_ts"] == entry["fetched_ts"]):
+        return "same_fetch", close
+    return "ok", close
+
+
+def pl_series(histories: dict[str, History]) -> dict[tuple, list[dict]]:
+    """Distinct PropLine legs: (sport, player, stat, line, round(start)) -> rows by time."""
+    series: dict[tuple, list[dict]] = defaultdict(list)
+    for h in histories.values():
+        for r in h.propline:
+            series[(r["sport"] or h.sport, r["player"], r["stat"], float(r["line"]), round(r["start_ts"] or 0))].append(r)
+    return series
+
+
+def brier_line(pairs: list[tuple[float, int, str, float]]) -> str:
+    """pairs: (p_over, 1 if More hit else 0, player, start/game key). Brier and log-loss with a bootstrap CI."""
+    if not pairs:
+        return "n=0 settled"
+    b = [(p - y) ** 2 for p, y, _, _ in pairs]
+    ll = [-(y * math.log(min(max(p, 1e-6), 1 - 1e-6)) + (1 - y) * math.log(1 - min(max(p, 1e-6), 1 - 1e-6)))
+          for p, y, _, _ in pairs]
+    ci = signals.bootstrap_ci(b)
+    return (f"n={len(pairs):<4} games {len({g for *_, g in pairs}):<3} players {len({pl for _, _, pl, _ in pairs}):<3} "
+            f"Brier {statistics.fmean(b):.4f}" + (f" [{ci[0]:.4f}, {ci[1]:.4f}]" if ci else "")
+            + f"  log-loss {statistics.fmean(ll):.4f}  mean p {statistics.fmean(p for p, *_ in pairs):5.1%}  "
+            f"hit {statistics.fmean(y for _, y, *_ in pairs):5.1%}" + ("  (insufficient data)" if len(pairs) < signals.MIN_N else ""))
+
+
+def propline_lines(recs: list[dict], histories: dict[str, History], outcomes: "Outcomes", now: float) -> list[str]:
+    """PropLine shadow vs the live Odds API path, split by sport, stat and source, on distinct legs. Logged only:
+    nothing here is a reason to switch source (a separate decision after the 4-week trial, with replay and
+    out-of-sample validation)."""
+    from local import propline_shadow as ps
+    out = [f"\nPROPLINE SHADOW ({ps.LABEL})",
+           " rules: 30 distinct legs = preliminary look only; 300 = evaluation target, not proof; no production change or "
+           "source switch without historical replay + out-of-sample validation + separate approval",
+           " " + LEG_DISTINCT_NOTE]
+    series = pl_series(histories)
+    if not series:
+        return out + ["  no PropLine shadow rows logged yet"]
+    # ---------------------------------------------------------------- coverage
+    out.append("\n [1] coverage: distinct in-window board legs (game 10 min to 3 h away, the live books window); a leg "
+               "counts as priced if ANY read priced it")
+    out.append("     note: the Odds API is asked only for legs Kalshi can't price (sentinel.kalshi_liquid) and only within "
+               "the credit budget: its column is what live priced, not what it could have")
+    cov: dict[tuple, list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+    for k, rows in series.items():
+        sport, player, stat, line, start = k
+        h = histories.get(sport)
+        books = bool(h and h.series.get(series_key(player, stat, line, "books", start)))
+        kalshi = bool(h and h.series.get(series_key(player, stat, line, "kalshi", start)))
+        pl = any(r["p_live"] is not None for r in rows)
+        anyb = any((r["n_books"] or 0) > 0 for r in rows)
+        for key in ((sport, "ALL"), (sport, stat)):
+            c = cov[key]
+            c[0] += 1; c[1] += pl; c[2] += anyb; c[3] += books; c[4] += kalshi
+    pct = lambda a, n: f"{a / n:5.0%}" if n else "  n/a"
+    for (sport, stat), c in sorted(cov.items(), key=lambda kv: (kv[0][0], kv[0][1] != "ALL", -kv[1][0])):
+        out.append(f"   {sport.upper():<4} {stat:<30} n={c[0]:<5} PropLine live-method {pct(c[1], c[0])}  PropLine any book "
+                   f"{pct(c[2], c[0])}  Odds API {pct(c[3], c[0])}  Kalshi (live) {pct(c[4], c[0])}")
+    why = Counter(r["unpriced_reason"] for rows in series.values() for r in rows[-1:] if r["unpriced_reason"])
+    out.append("   PropLine unpriced, by the reason on each leg's LAST row: "
+               + (", ".join(f"{k} {v}" for k, v in why.most_common()) if why else "none"))
+    # ---------------------------------------------------------------- freshness
+    out.append("\n [2] price age at the first priced read, per source (distinct legs)")
+    pl_age, ob_age = defaultdict(list), defaultdict(list)
+    for k, rows in series.items():
+        first = next((r for r in rows if r["p_live"] is not None), None)
+        if first:
+            a = (json.loads(first["ages_json"] or "{}").get("data_age_s") or {}).get("value")
+            if a is not None:
+                pl_age[k[0]].append(a)
+        h = histories.get(k[0])
+        bs = h.board_series.get(series_key(k[1], k[2], k[3], "books", k[4])) if h else None
+        if bs and bs[0].age_s is not None:
+            ob_age[k[0]].append(bs[0].age_s)
+    for sport in sorted(set(pl_age) | set(ob_age)):
+        for name, xs in (("PropLine (now - oldest contributing market last_update)", pl_age[sport]),
+                         ("Odds API (logged price_age_s)", ob_age[sport])):
+            out.append(f"   {sport.upper():<4} {name:<58} " + (f"n={len(xs):<5} median {statistics.median(xs) / 60:6.1f} min  "
+                                                              f"p90 {ps.p_quantile(xs, 0.9) / 60:6.1f} min" if xs else "n=0"))
+    # ---------------------------------------------------------------- closing completeness + CLV (b): first read
+    out.append("\n [3] closing completeness per source (entry = first read; close = last read at or before the start)")
+    out.append(" " + snapshots.CLOSING_WARNING)
+    board_recs: dict[str, list[dict]] = defaultdict(list)
+    ob_recs: dict[str, list[dict]] = defaultdict(list)
+    for k, rows in series.items():
+        first = next((r for r in rows if r["p_live"] is not None), None)
+        reason, close = pl_close(rows, first, k[4], now)
+        board_recs[k[0]].append({"player": k[1], "game": rows[0]["game"], "start": k[4], "stat": k[2], "close_reason": reason,
+                                 "clv": (close["p_live"] - first["p_live"]) if reason == "ok" else None,
+                                 "p": first["p_live"] if first else None, "key": k})
+        h = histories.get(k[0])
+        bs = h.board_series.get(series_key(k[1], k[2], k[3], "books", k[4])) if h else None
+        if bs:
+            if not k[4] or k[4] > now:
+                r2, clv2 = "open", None
+            else:
+                before = [x for x in h.series.get(series_key(k[1], k[2], k[3], "books", k[4]), []) if x.ts <= k[4]]
+                c = before[-1] if before else None
+                fetched = lambda x: (json.loads(x.pricing) if x is not None and x.pricing else {}).get("fetched_ts")
+                if c is None:
+                    r2, clv2 = "missing", None
+                elif k[4] - c.ts > snapshots.STALE_CLOSE_S:
+                    r2, clv2 = "stale", None
+                elif c is bs[0] or (fetched(c) is not None and fetched(c) == fetched(bs[0])):
+                    r2, clv2 = "same_fetch", None
+                else:
+                    r2, clv2 = "ok", c.p_over - bs[0].p_over
+            ob_recs[k[0]].append({"player": k[1], "game": bs[0].game, "start": k[4], "close_reason": r2, "clv": clv2})
+    for sport in sorted(board_recs):
+        out.append(f"   {sport.upper():<4} PropLine  {signals.quality_line(board_recs[sport])}")
+        out.append(f"   {sport.upper():<4} Odds API  {signals.quality_line(ob_recs.get(sport, []))}")
+    out.append("\n [4b] CLV, entry (b): FIRST PropLine read, all in-window board legs, More side (P(over) close - entry). "
+               "Never mixed with (a)")
+    out.append(" " + snapshots.CLOSING_WARNING)
+    for sport in sorted(board_recs):
+        out.append(f"   {sport.upper():<4} PropLine live method  {signals.signal_cell([r for r in board_recs[sport] if r['close_reason'] == 'ok'])}")
+        out.append(f"   {sport.upper():<4} Odds API (same rule)  {signals.signal_cell([r for r in ob_recs.get(sport, []) if r['close_reason'] == 'ok'])}")
+    # ---------------------------------------------------------------- CLV (a): chosen legs at entry_ts
+    out.append("\n [4a] CLV, entry (a): PropLine read at or before the slip's entry_ts, legs the live/paper builder CHOSE, "
+               "side taken. Never mixed with (b)")
+    out.append(" " + snapshots.CLOSING_WARNING)
+    chosen: dict[tuple, dict] = {}
+    for r in sorted(recs, key=lambda r: r["entry_ts"]):
+        sport, player, stat, line, side, source, start = r["identity"]
+        k = (sport, player, stat, float(line), round(start or 0), side)
+        if k in chosen:
+            continue  # one observation per distinct leg (and side)
+        rows = series.get(k[:5])
+        if not rows:
+            chosen[k] = {"player": player, "game": r.get("game"), "start": start, "close_reason": "missing", "clv": None,
+                         "builder": r["builder"]}
+            continue
+        entry = next((x for x in reversed(rows) if x["ts"] <= r["entry_ts"] and x["p_live"] is not None), None)
+        reason, close = pl_close(rows, entry, start, now)
+        if entry is None and reason != "open":
+            reason = "missing"
+        sgn = 1 if side == "More" else -1
+        chosen[k] = {"player": player, "game": r.get("game"), "start": start, "close_reason": reason, "builder": r["builder"],
+                     "clv": sgn * (close["p_live"] - entry["p_live"]) if reason == "ok" else None}
+    by_b = defaultdict(list)
+    for v in chosen.values():
+        by_b[v["builder"]].append(v)
+    for b in ("live", "paper"):
+        mine = by_b.get(b, [])
+        out.append(f"   {b:<6} {signals.quality_line(mine)}")
+        out.append(f"   {'':<6} CLV {signals.signal_cell([v for v in mine if v['close_reason'] == 'ok'])}")
+    # ---------------------------------------------------------------- calibration
+    out.append("\n [5] calibration vs ESPN-graded outcomes (More side, first priced read per distinct leg; cached results only "
+               "unless --grade)")
+    cal: dict[tuple, list] = defaultdict(list)
+    for k, rows in series.items():
+        sport, player, stat, line, start = k
+        if not start or start > now - grade_slips.SETTLE_AFTER_H * 3600:
+            continue
+        res = outcomes.result(LegEntry(sport, player, stat, line, "More", 0.5, ps.SOURCE, start, rows[0]["team"] or "",
+                                       rows[0]["game"] or ""), now)[0]
+        if res not in ("hit", "miss"):
+            continue
+        y = 1 if res == "hit" else 0
+        g = (rows[0]["game"], start)
+        for f, name in PL_FAIRS:
+            first = next((r for r in rows if r[f] is not None), None)
+            if first:
+                cal[(sport, name)].append((first[f], y, player, g))
+        h = histories.get(sport)
+        bs = h.board_series.get(series_key(player, stat, line, "books", start)) if h else None
+        if bs:
+            cal[(sport, "Odds API books")].append((bs[0].p_over, y, player, g))
+    if not cal:
+        out.append("   no settled, graded PropLine legs yet")
+    for (sport, name), pairs in sorted(cal.items()):
+        out.append(f"   {sport.upper():<4} {name:<26} {brier_line(pairs)}")
+    # ---------------------------------------------------------------- cost
+    out.append("\n [6] cost: PropLine requests per distinct priced leg vs Odds API credits per distinct books-priced leg")
+    for sport in sorted({s["sport"] for h in histories.values() for s in h.propline_sweeps}):
+        reqs = sum(s["requests"] or 0 for h in histories.values() for s in h.propline_sweeps if s["sport"] == sport)
+        priced = sum(1 for k, rows in series.items() if k[0] == sport and any(r["p_live"] is not None for r in rows))
+        out.append(f"   {sport.upper():<4} PropLine {reqs} requests / {priced} priced legs = "
+                   + (f"{reqs / priced:.2f} per leg" if priced else "n/a"))
+    days: dict[str, int] = {}
+    groups: dict[str, dict] = {}
+    for h in histories.values():
+        for s in h.propline_sweeps:
+            u = s.get("odds_api_usage") or {}
+            if u.get("date") and isinstance(u.get("used"), int):
+                days[u["date"]] = max(days.get(u["date"], 0), u["used"])
+                groups[u["date"]] = u.get("by_group") or {}
+    ob_priced = sum(1 for k in series if histories.get(k[0]) and
+                    histories[k[0]].series.get(series_key(k[1], k[2], k[3], "books", k[4])))
+    credits = sum(days.values())
+    out.append(f"   Odds API {credits} credits on {len(days)} day(s) (ALL sports sharing the cap, as the live cache recorded "
+               f"them while the shadow ran) / {ob_priced} books-priced shadow-window legs = "
+               + (f"{credits / ob_priced:.2f} per leg (upper bound: the credits include sports and legs outside this table)"
+                  if ob_priced else "n/a"))
+    # ---------------------------------------------------------------- Novig / ProphetX, sharp consensus
+    out.append("\n [7] book presence (first PropLine read with any two-sided book, distinct legs) and the sharp-weighted "
+               "consensus vs the live method")
+    for sport in sorted({k[0] for k in series}):
+        firsts = [next((r for r in rows if (r["n_books"] or 0) > 0), None) for k, rows in series.items() if k[0] == sport]
+        firsts = [r for r in firsts if r]
+        if not firsts:
+            out.append(f"   {sport.upper():<4} no PropLine read with a two-sided book yet")
+            continue
+        pres = Counter()
+        for r in firsts:
+            for b, v in json.loads(r["presence_json"] or "{}").items():
+                pres[b] += bool(v.get("value"))
+        out.append(f"   {sport.upper():<4} n={len(firsts):<5} " + "  ".join(f"{b} {pres[b] / len(firsts):4.0%}" for b in ps.PRESENCE))
+        sharp = [r for r in firsts if r["p_sharp"] is not None]
+        d = [r["p_sharp"] - r["p_live"] for r in sharp if r["p_live"] is not None]
+        out.append(f"   {'':<4} sharp consensus available {len(sharp) / len(firsts):4.0%}; vs PropLine live method: "
+                   + (f"n={len(d)} mean {statistics.fmean(d) * 100:+.2f} median {statistics.median(d) * 100:+.2f} "
+                      f"mean |d| {statistics.fmean(abs(x) for x in d) * 100:.2f} pts" if d else "n=0"))
+        h = histories.get(sport)
+        dl = []
+        for k, rows in series.items():
+            if k[0] != sport or not h:
+                continue
+            first = next((r for r in rows if r["p_live"] is not None), None)
+            ob = h.read_at(series_key(k[1], k[2], k[3], "books", k[4]), first["ts"]) if first else None
+            if ob is not None:
+                dl.append(first["p_live"] - ob.p_over)
+        out.append(f"   {'':<4} PropLine live method - Odds API live price (last books read at or before the PropLine read): "
+                   + (f"n={len(dl)} mean {statistics.fmean(dl) * 100:+.2f} median {statistics.median(dl) * 100:+.2f} pts"
+                      if dl else "n=0"))
+    return out
+
+
 def gap_unit_bucket(gap: float) -> str:
     return next(label for top, label in GAP_UNIT_BUCKETS if gap < top)
 
@@ -902,6 +1163,7 @@ def run(paths: list[Path], cfg: dict | None = None, outcomes: Outcomes | None = 
     out += slice_lines(recs)
     out += coverage_lines(list(histories.values()), since)
     out += signal_lines(recs, histories, outcomes, now)
+    out += propline_lines(recs, histories, outcomes, now)
     if outcomes.fetched:
         out.append(f"\n{outcomes.fetched} leg results graded this run (ESPN box scores, now cached)")
     if slips_csv:

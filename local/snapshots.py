@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS shadow_prices (id INTEGER PRIMARY KEY, ts REAL, kind 
     player TEXT, stat TEXT, line REAL, odds_type TEXT, side TEXT, team TEXT, game TEXT, start_ts REAL, p_fair REAL,
     source TEXT, method TEXT, pricing_json TEXT, price_age_s REAL, calc_version TEXT);
 CREATE INDEX IF NOT EXISTS shadow_prop ON shadow_prices (player, stat, line, odds_type, ts);
+CREATE TABLE IF NOT EXISTS propline_sweeps (id INTEGER PRIMARY KEY, ts REAL, sport TEXT, utc_day TEXT, requests INTEGER,
+    x_daily_used INTEGER, x_daily_limit INTEGER, x_daily_reset INTEGER, budget_used INTEGER, events_requested INTEGER,
+    legs_in_window INTEGER, legs_priced INTEGER, stopped TEXT, sweep_json TEXT, calc_version TEXT);
+CREATE TABLE IF NOT EXISTS propline_prices (id INTEGER PRIMARY KEY, sweep_id INTEGER, ts REAL, board_ts REAL, sport TEXT,
+    player TEXT, stat TEXT, line REAL, team TEXT, game TEXT, start_ts REAL, event_id TEXT, market_key TEXT,
+    read_kind TEXT, fetched_ts REAL, p_live REAL, p_shin REAL, p_sharp REAL, n_books INTEGER, unpriced_reason TEXT,
+    fair_json TEXT, books_json TEXT, presence_json TEXT, kalshi_json TEXT, ages_json TEXT, event_json TEXT,
+    dfs_json TEXT, calc_version TEXT);
+CREATE INDEX IF NOT EXISTS propline_prop ON propline_prices (player, stat, line, start_ts, ts);
 """
 # columns added after the first databases were written: (table, column, type)
 MIGRATIONS = [("cycles", "eligible_json", "TEXT"), ("cycles", "coverage_json", "TEXT"),
@@ -325,6 +334,35 @@ class Snapshots:
             written += 1
         self.db.commit()
         return written
+
+    def propline_sweep(self, rec: dict) -> int:
+        """PropLine shadow (local/propline_shadow.py): one sweep's requests, quota headers, coverage and errors."""
+        cur = self.db.execute("INSERT INTO propline_sweeps (ts, sport, utc_day, requests, x_daily_used, x_daily_limit, "
+                              "x_daily_reset, budget_used, events_requested, legs_in_window, legs_priced, stopped, sweep_json, "
+                              "calc_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (rec["ts"], rec["sport"], rec["utc_day"], rec["requests"], rec["x_daily_used"],
+                               rec["x_daily_limit"], rec["x_daily_reset"], rec["budget_used"], rec["events_requested"],
+                               rec["legs_in_window"], rec["legs_priced"], rec["stopped"], json.dumps(rec), rec["calc_version"]))
+        self.db.commit()
+        return cur.lastrowid
+
+    def propline_prices(self, sweep_id: int, board_ts: float | None, rows: list[dict]) -> int:
+        """PropLine shadow rows: every read (not change-only), plus no-read rows with their reason. Own table: never
+        read by live CLV, steam, the replay or any builder."""
+        for r in rows:
+            f = r["fair"]
+            self.db.execute("INSERT INTO propline_prices (sweep_id, ts, board_ts, sport, player, stat, line, team, game, "
+                            "start_ts, event_id, market_key, read_kind, fetched_ts, p_live, p_shin, p_sharp, n_books, "
+                            "unpriced_reason, fair_json, books_json, presence_json, kalshi_json, ages_json, event_json, "
+                            "dfs_json, calc_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (sweep_id, r["ts"], board_ts, r["sport"], r["player"], r["stat"], r["line"], r["team"],
+                             r["game"], r["start_ts"], r["event_id"], r["market_key"], r["read_kind"], r["fetched_ts"],
+                             f["p_live"]["value"], f["p_shin"]["value"], f["p_sharp"]["value"],
+                             sum(1 for q in r["books"].values() if "fair_live" in q), r["unpriced_reason"],
+                             json.dumps(f), json.dumps(r["books"]), json.dumps(r["presence"]), json.dumps(r["kalshi"]),
+                             json.dumps(r["ages"]), json.dumps(r["event"]), json.dumps(r["dfs"]), f["p_live"]["calc_version"]))
+        self.db.commit()
+        return len(rows)
 
     def record_stats(self, slip_id: str, l: scanner.Leg, rec: dict) -> int:
         """Store a leg's stats-vs-market gap (local/stat_research.py) on its slip_legs row."""

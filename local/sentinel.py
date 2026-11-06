@@ -419,6 +419,20 @@ def h2h_on_board(a, rows: list[dict], board_ts: float) -> bool:
         return False
 
 
+def propline_tick(a) -> None:
+    """PropLine shadow (local/propline_shadow.py): after cycle() has returned (live pricing, selection, JIT, alerts
+    and the ledger all done), one background pass that reads the lines CSV itself and writes only its own tables.
+    Skipped while the previous pass runs. Never raises."""
+    shadow = getattr(a, "propline", None)
+    if shadow is None or getattr(a, "snapshots", None) is None or shadow.busy or shadow.disabled:
+        return
+    try:
+        csv = Path(a.csv)
+        background(a, shadow.tick(csv, a.snapshots, board_ts=csv.stat().st_mtime if csv.exists() else None))
+    except Exception as err:  # noqa: BLE001
+        print(f"{time.strftime('%H:%M:%S')} PropLine shadow not run: {type(err).__name__}")
+
+
 def background(a, coro) -> None:
     """Run `coro` alongside the polling loop (it gets time while the loop sleeps); errors are printed,
     never raised into a cycle. Tasks are kept on `a` so they aren't garbage-collected mid-run."""
@@ -937,6 +951,13 @@ async def main() -> None:
     for n in (a.targeted or {}).get("notes", []):
         print(f"{time.strftime('%H:%M:%S')} watchlist: {n}")
     a.shadow_rows = []
+    a.propline = None  # PropLine shadow: logged only, off unless signals.propline_shadow (and a key in .env)
+    if pipeline_config.CONFIG.get("signals", {}).get("propline_shadow"):
+        try:
+            from local import propline_shadow
+            a.propline = propline_shadow.Shadow.from_env(a.sport)
+        except Exception as err:  # noqa: BLE001
+            print(f"{time.strftime('%H:%M:%S')} PropLine shadow not started: {type(err).__name__}")
 
     def on_board(feed, board_ts, rows, bad):
         a.board_info = {"board_ts": board_ts}  # whole lines now reach pricing; the cycle counts unpriced ones
@@ -966,6 +987,7 @@ async def main() -> None:
             await cycle(a, sent, chat_id)
         except Exception as e:  # a network blip shouldn't kill an all-evening watch
             print(f"{time.strftime('%H:%M:%S')} cycle failed: {e!r}")
+        propline_tick(a)  # logged-only shadow, after the cycle, in the background
         if a.once:
             pending = set(a.__dict__.get("background_tasks") or set())
             if getattr(a, "h2h", None) is not None and a.h2h.task is not None:
