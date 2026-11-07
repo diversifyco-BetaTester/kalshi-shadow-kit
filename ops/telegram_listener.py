@@ -109,7 +109,7 @@ def status(now: float | None = None, pids: dict[str, list[int]] | None = None) -
     if u:
         groups = " · ".join(f"{g} {n}" for g, n in sorted((u.get("by_group") or {}).items()))
         lines.append(f"Odds API: {u.get('remaining', '?')} credits left this month · today {u.get('used', 0)}/"
-                     f"{u.get('cap', '?')}" + (f" ({groups})" if groups else "") + f" (as of {u.get('date', '?')})")
+                     + ("no cap" if u.get("uncapped") else f"{u.get('cap', '?')}") + (f" ({groups})" if groups else "") + f" (as of {u.get('date', '?')})")
     else:
         lines.append("Odds API: no usage recorded yet")
     return "\n".join(lines)

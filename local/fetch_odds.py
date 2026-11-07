@@ -80,6 +80,7 @@ TTL_S = 3600
 MAX_AGE_S = 3 * 3600
 DAILY_CAP = 15  # ~500 credits / 31 days
 RESERVE = 25
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")  # odds_budget.shares_by_weekday keys
 LOOKAHEAD_H = 3  # pre-game window for paid requests (was 8 h: credits ran out before evening games)
 TIMEOUT_S = 15
 ALT = "_alternate"
@@ -362,6 +363,10 @@ def group_limits(cap: int, shares: dict) -> dict[str, int]:
 
 def budget_line(u: dict, shares: dict) -> str:
     """'Odds API today: 12/80 · nfl 10/40 · other 2/40' (spend per group against its share of the cap)."""
+    if u.get("uncapped"):
+        spent = " · ".join(f"{g} {n}" for g, n in sorted((u.get("by_group") or {}).items()))
+        return (f"Odds API today: {u.get('used', 0)} used, no daily cap ({u.get('remaining', '?')} left this month)"
+                + (f" · {spent}" if spent else ""))
     cap = int(u.get("cap") or 0)
     groups = " · ".join(f"{g} {(u.get('by_group') or {}).get(g, 0)}/{n}" for g, n in group_limits(cap, shares).items())
     return f"Odds API today: {u.get('used', 0)}/{cap}" + (f" · {groups}" if groups else "")
@@ -374,7 +379,8 @@ class OddsBook:
     def __init__(self, key: str, cache: Path = CACHE, ttl_s: float = TTL_S, daily_cap: int = DAILY_CAP,
                  reserve: int = RESERVE, get=None, window_h: float = LOOKAHEAD_H, shares: dict | None = None):
         self.key, self.cache_path, self.ttl_s, self.daily_cap, self.reserve = key, cache, ttl_s, daily_cap, reserve
-        self.shares = dict(pipeline_config.CONFIG["odds_budget"]["shares"] if shares is None else shares)
+        self._shares = None if shares is None else dict(shares)  # fixed (tests); None = from config, per weekday
+        self.uncapped = bool(pipeline_config.CONFIG["odds_budget"].get("uncapped"))
         self.window_h = window_h  # only games starting within this many hours are priced from the books
         self.get = get or self._http_get
         self.load()
@@ -414,7 +420,17 @@ class OddsBook:
             u.update(date=date.today().isoformat(), used=0, cap=0, by_group={})
         u["cap"] = max(int(u.get("cap") or 0), self.daily_cap)  # raise the shared cap, never lower it
         u.setdefault("by_group", {})  # credits spent before the split existed count toward the cap only
+        u["uncapped"] = self.uncapped  # for /status, which reads the file without the config
         return u
+
+    @property
+    def shares(self) -> dict:
+        """Today's per-sport shares: odds_budget.shares_by_weekday[today] if set, else odds_budget.shares."""
+        if self._shares is not None:
+            return self._shares
+        ob = pipeline_config.CONFIG["odds_budget"]
+        day = WEEKDAYS[date.today().weekday()]
+        return dict((ob.get("shares_by_weekday") or {}).get(day, ob["shares"]))
 
     def group(self, sport: str | None) -> str | None:
         """The budget group a sport spends from: its own name if it has a share, else "other" (if set)."""
@@ -425,7 +441,7 @@ class OddsBook:
     def group_limit(self, sport: str | None) -> int | None:
         """Today's credits this sport's group may spend: floor(share * shared cap); None = no split."""
         g = self.group(sport)
-        return None if g is None else group_limits(self.cap(), self.shares)[g]
+        return None if g is None or self.uncapped else group_limits(self.cap(), self.shares)[g]
 
     def cap(self) -> int:
         return self.usage()["cap"]
@@ -433,7 +449,9 @@ class OddsBook:
     def affordable(self, cost: int, sport: str | None = None) -> bool:
         u = self.usage()
         remaining = u.get("remaining")
-        if remaining is None or u["used"] + cost > u["cap"] or remaining - cost < self.reserve:
+        if remaining is None or remaining - cost < self.reserve:
+            return False
+        if not self.uncapped and u["used"] + cost > u["cap"]:
             return False
         limit = self.group_limit(sport)
         return limit is None or u["by_group"].get(self.group(sport), 0) + cost <= limit
@@ -662,7 +680,8 @@ class OddsBook:
             u = self.usage()
             g, limit = self.group(sport), self.group_limit(sport)
             share = f", {g} share {u['by_group'].get(g, 0)}/{limit}" if limit is not None else ""
-            self.notes.append(f"{skipped} market refresh(es) skipped: budget {u['used']}/{u['cap']} today{share}, "
+            cap = "no cap" if self.uncapped else u["cap"]
+            self.notes.append(f"{skipped} market refresh(es) skipped: budget {u['used']}/{cap} today{share}, "
                               f"{u.get('remaining', '?')} left (reserve {self.reserve})")
         self.save()
         return priced

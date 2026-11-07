@@ -906,7 +906,8 @@ async def main() -> None:
     ap.add_argument("--odds-budget", type=int, default=fetch_odds.DAILY_CAP,
                     help="Odds API credits per day; a higher value raises the cap shared by every sentinel "
                          "for today (the reserve is always kept). The cap is split by sport with "
-                         "pipeline_config odds_budget.shares (default NFL half, every other sport half)")
+                         "pipeline_config odds_budget.shares (default NFL half, every other sport half); "
+                         "ignored when odds_budget.uncapped is true")
     ap.add_argument("--window-hours", type=float, default=fetch_odds.LOOKAHEAD_H,
                     help="only buy sportsbook odds for games starting within this many hours")
     ap.add_argument("--no-odds", action="store_true", help="don't price Kalshi-unpriced legs from The Odds API")
