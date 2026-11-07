@@ -584,7 +584,7 @@ def notify_settled(path: Path = ledger.LEDGER, now: float | None = None, send=No
         batches = [(due, bulk_card(due, rows, now))] if len(due) > BULK_MAX else [([r], settle_card(r, rows, now)) for r in due]
         out = []
         for slips, text in batches:
-            try:
+            try:  # telegram.send is True for an unconfirmed send too (reply timed out): never re-announced
                 ok = send(text, chat_id=chat)
             except Exception as e:  # a Telegram outage must not lose the grading
                 ok, err = False, e

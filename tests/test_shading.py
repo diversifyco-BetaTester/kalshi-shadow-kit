@@ -228,3 +228,28 @@ def test_whole_line_pushes_leave_the_hit_rate_denominator():
     mostly_pushes = [(day(i), "X", v) for i, v in enumerate([3, 3, 3, 3, 3, 3, 2, 4, 3, 3])]
     rec = stat_research.gap_record(mostly_pushes, 3.0, "Less", 0.60, now, 10, 5)
     assert rec["hit_rate"] is None and "2 decided games" in rec["note"]
+
+
+def test_an_unconfirmed_alert_keeps_its_legs_and_is_not_resent(tmp_path, monkeypatch, capsys):
+    """Reply timed out after the request went out (2026-11-07): treat as delivered, never re-send."""
+    players = [f"Player {c}" for c in "ABCDEF"]
+
+    async def quotes(series):
+        return [scanner.Quote("kalshi", f"KXNHLPTS-98DEC31G{i}-{p}", f"{p}: 1+ points", 0.62, 0.02, title=f"{p}: 1+ points")
+                for i, p in enumerate(players)]
+
+    calls = []
+
+    async def send(text, chat_id=None):
+        calls.append(text)
+        return "unconfirmed"
+    monkeypatch.setattr(sentinel.scanner, "kalshi_quotes", quotes)
+    monkeypatch.setattr(sentinel, "send_async", send)
+    a, sent = cycle_args(tmp_path, players), []
+    asyncio.run(sentinel.cycle(a, sent, chat_id="1"))
+    first = len(calls)
+    assert first and sent and a.sent_props_cache
+    assert "legs released" not in capsys.readouterr().out
+    assert "unconfirmed" in (tmp_path / "l.csv").read_text()
+    asyncio.run(sentinel.cycle(a, sent, chat_id="1"))          # next cycle: same board, same slip
+    assert len(calls) == first                                 # not sent again
