@@ -17,6 +17,12 @@ def test_hour_window():
     assert ar.next_run(d(21, 30), 12, 21) == datetime(2026, 10, 16, 12)   # evening: noon tomorrow
 
 
+def test_default_window_is_around_the_clock():
+    d = lambda h, m=0: datetime(2026, 11, 7, h, m)
+    for h, m in ((0, 0), (3, 30), (11, 59), (21, 0), (23, 59)):
+        assert ar.next_run(d(h, m), ar.START_HOUR, ar.END_HOUR) == d(h, m)   # never sleeps until a window
+
+
 class FakeBoard:
     """osa_raw stand-in for one PrizePicks tab. A reload shows the featured sport (NFL) only; clicking a
     sport tab adds that league's projections to the store, unless it is listed in `slow` (first click

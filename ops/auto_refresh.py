@@ -1,7 +1,7 @@
 """
 auto_refresh.py — refresh the sentinels' PrizePicks boards from your own open Chrome tab.
 
-Every --interval minutes (7) between --start-hour and --end-hour (12:00-21:00 local), in the first
+Every --interval minutes (7) between --start-hour and --end-hour (default 0-24: around the clock), in the first
 open Chrome tab whose title or URL contains "PrizePicks":
   1. reload it (skip with --no-reload) and wait for the board,
   2. click each sport tab in --leagues (NFL, NHL, MLB), CLICK_DELAY_S apart, so the app loads every
@@ -46,7 +46,7 @@ DUMP_JS = ROOT / "scripts" / "prizepicks_scraper.js"
 SYNC = ROOT / "ops" / "sync_boards.sh"
 DOWNLOADS = Path(os.environ.get("DOWNLOADS", Path.home() / "Downloads"))
 INTERVAL_MIN = 7  # PrizePicks bumps lines and flips them to goblin/demon within ~20 min
-START_HOUR, END_HOUR = 12, 21
+START_HOUR, END_HOUR = 0, 24  # 24/7 since 2026-11-07 (overnight alerts); --start-hour/--end-hour narrow it
 LOAD_TIMEOUT_S = 60
 LEAGUES = ("NFL", "NHL", "MLB")
 CLICK_DELAY_S = 2.5  # after each sport tab click, for the app to fetch that league
@@ -311,8 +311,9 @@ def main() -> None:
     ap.add_argument("--diagnose", action="store_true",
                     help="read-only: show exactly what Chrome returns for each PrizePicks tab, then exit")
     ap.add_argument("--interval", type=float, default=INTERVAL_MIN, help="minutes between refreshes")
-    ap.add_argument("--start-hour", type=int, default=START_HOUR)
-    ap.add_argument("--end-hour", type=int, default=END_HOUR, help="no refresh starts at or after this hour")
+    ap.add_argument("--start-hour", type=int, default=START_HOUR, help="first hour of the refresh window (default 0)")
+    ap.add_argument("--end-hour", type=int, default=END_HOUR,
+                    help="no refresh starts at or after this hour (default 24: no nightly pause)")
     a = ap.parse_args()
     if a.diagnose:
         return diagnose()
