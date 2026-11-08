@@ -967,7 +967,7 @@ async def main() -> None:
     print(f"sentinel: {a.sport.upper()} | feed {a.feed} or {a.board} | every {a.interval:.0f}s | alert >= {leg_floor(a, a.sport):.1%}{' (flex 5/6)' if a.flex else ''}"
           + (" · floors " + ", ".join(f"{s.upper()} {leg_floor(a, s):.1%}" for s in sorted(pipeline_config.CONFIG["min_fair_by_sport"]))
              if pipeline_config.CONFIG["min_fair_by_sport"] else "") + " | "
-          + (f"books fallback on (games within {a.odds.window_h:g} h, budget {a.odds.cap()}/day shared, "
+          + (f"books fallback on (games within {a.odds.window_h:g} h, budget {'uncapped' if a.odds.uncapped else f'{a.odds.cap()}/day shared'}, "
              f"reserve {a.odds.reserve})" if a.odds
              else "no books fallback") + " | "
           + (f"Telegram chat {chat_id}" if chat_id else "no TELEGRAM_ALERT_CHAT_ID: terminal only"))
