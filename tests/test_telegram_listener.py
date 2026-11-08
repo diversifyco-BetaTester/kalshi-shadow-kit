@@ -24,6 +24,8 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(tl, "DOWNLOADS", tmp_path)
     monkeypatch.setattr(tl, "OFFSET", tmp_path / "offset")
     monkeypatch.setattr(tl, "sentinel_pids", lambda: {"nhl": [11], "mlb": [], "nfl": [12, 13], "nba": [14], "cfb": []})
+    monkeypatch.setattr(tl, "AUTO_STATUS", tmp_path / "auto_refresh_status.json")
+    monkeypatch.setattr(tl, "auto_refresh_pids", lambda: [21])
     return tmp_path
 
 
@@ -173,3 +175,18 @@ def test_status_shows_a_waiting_sentinel_as_alive_not_hung(state):
     (state / ".heartbeat_nba.json").write_text(json.dumps({"ts": NOW - 40, "state": "waiting for a fresh board (116 min old)"}))
     s = tl.status(NOW)
     assert "• <b>NBA</b>: ⏸️ waiting for a fresh board (116 min old)" in s and "last cycle" not in s.split("NBA")[1].split("\n")[0]
+
+
+def test_status_warns_after_30_minutes_without_a_board_refresh(state):
+    """2026-11-08: 20 refreshes failed in a row (01:28-04:15) and /status never said so."""
+    st = state / "auto_refresh_status.json"
+    st.write_text(json.dumps({"last_ok_ts": NOW - 5 * 60, "fails_in_row": 0}))
+    assert "✅ Board refresh: last sync 5 min ago" in tl.status(NOW)
+    st.write_text(json.dumps({"last_ok_ts": NOW - 20 * 60, "fails_in_row": 2, "last_error": "osascript timed out"}))
+    assert "✅ Board refresh: last sync 20 min ago · 2 failed since" in tl.status(NOW)
+    st.write_text(json.dumps({"last_ok_ts": NOW - 175 * 60, "fails_in_row": 20, "last_error": "TimeoutExpired: osascript <x>"}))
+    s = tl.status(NOW)
+    assert "⚠️ Board refresh: no successful sync for 2.9 h (20 failed in a row: TimeoutExpired: osascript &lt;x&gt;)" in s
+    st.write_text(json.dumps({"sleeping_until": NOW + 3600, "last_ok_ts": NOW - 9 * 3600}))
+    assert "⏸️ Board refresh: outside its hours" in tl.status(NOW)
+    assert "⛔ Board refresh: auto_refresh not running" in tl.status(NOW, refresher=[])

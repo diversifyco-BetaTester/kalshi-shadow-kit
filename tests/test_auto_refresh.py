@@ -155,3 +155,26 @@ def test_diagnose_is_read_only(monkeypatch, capsys):
     monkeypatch.setattr(ar, "osa_raw", chrome)
     ar.diagnose()
     assert calls == ["list", "probe", "dump"] and "props=0" in capsys.readouterr().out    # never "reload"
+
+
+def test_every_refresh_records_its_outcome_for_status(monkeypatch):
+    import json as _json
+    monkeypatch.setattr(ar, "_refresh", lambda reload, wanted: "the board never showed its sport tabs: boards unchanged")
+    ar.refresh()
+    ar.refresh()
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 2 and "last_ok_ts" not in st and "boards unchanged" in st["last_error"]
+    monkeypatch.setattr(ar, "_refresh", lambda reload, wanted: "13874 props {'NFL': 8833} | Boards synced for NFL.")
+    ar.refresh()
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 0 and st["last_ok_ts"] and st["last_error"] is None
+
+    def boom(reload, wanted):
+        raise ar.ChromeError("osascript timed out")
+    monkeypatch.setattr(ar, "_refresh", boom)
+    try:
+        ar.refresh()
+    except ar.ChromeError:
+        pass
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 1 and "osascript timed out" in st["last_error"] and st["last_ok_ts"]

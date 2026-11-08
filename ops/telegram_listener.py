@@ -52,6 +52,8 @@ HEARTBEAT = ROOT / "local" / ".heartbeat_{sport}.json"
 LEDGER = ROOT / "local" / "slips_history.csv"
 LINES = ROOT / "local" / "lines_{sport}.csv"
 DOWNLOADS = Path(os.environ.get("DOWNLOADS", Path.home() / "Downloads"))
+AUTO_STATUS = ROOT / "data" / "auto_refresh_status.json"  # ops/auto_refresh.py STATUS
+REFRESH_WARN_S = 30 * 60  # no successful board refresh for this long: warn
 POOL_STALE_S = 300          # ev_pool's STALE_S: a writer that stopped refreshing
 MAX_LINES = 40
 
@@ -83,10 +85,38 @@ def sentinel_pids() -> dict[str, list[int]]:
     return out
 
 
+def auto_refresh_pids() -> list[int]:
+    """PIDs of the ops.auto_refresh LOOP (a one-off --once from /refresh doesn't count; caffeinate excluded)."""
+    r = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True)
+    out = []
+    for line in r.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if "-m ops.auto_refresh" in cmd and "--once" not in cmd and "--diagnose" not in cmd and not cmd.startswith("caffeinate"):
+            out.append(int(pid))
+    return out
+
+
+def refresh_line(now: float, pids: list[int]) -> str:
+    """The board refresher's health: running, last successful sync, failures in a row."""
+    st = _json(AUTO_STATUS)
+    if not pids:
+        return "⛔ Board refresh: auto_refresh not running" + (f" (last sync {ago(st.get('last_ok_ts'), now)})" if st else "")
+    if (st.get("sleeping_until") or 0) > now:
+        return f"⏸️ Board refresh: outside its hours, next at {datetime.fromtimestamp(st['sleeping_until']):%a %H:%M}"
+    last_ok, fails = st.get("last_ok_ts"), int(st.get("fails_in_row") or 0)
+    if not last_ok or now - last_ok > REFRESH_WARN_S:
+        err = f": {html.escape(str(st.get('last_error') or '')[:80])}" if st.get("last_error") else ""
+        return (f"⚠️ Board refresh: no successful sync for {ago(last_ok, now).replace(' ago', '')}"
+                + (f" ({fails} failed in a row{err})" if fails else ""))
+    return f"✅ Board refresh: last sync {ago(last_ok, now)}" + (f" · {fails} failed since" if fails else "")
+
+
 # --------------------------------------------------------------------------- commands
-def status(now: float | None = None, pids: dict[str, list[int]] | None = None) -> str:
+def status(now: float | None = None, pids: dict[str, list[int]] | None = None,
+           refresher: list[int] | None = None) -> str:
     now = time.time() if now is None else now
     pids = sentinel_pids() if pids is None else pids
+    refresher = auto_refresh_pids() if refresher is None else refresher
     lines = ["<b>Pipeline status</b>"]
     for sport in SPORTS:
         hb = _json(Path(str(HEARTBEAT).format(sport=sport)))
@@ -105,6 +135,7 @@ def status(now: float | None = None, pids: dict[str, list[int]] | None = None) -
     dumps = [(Path(f).stat().st_mtime, Path(f).name) for f in glob.glob(str(DOWNLOADS / "*_board.json"))]
     lines.append(f"Latest board dump: {datetime.fromtimestamp(max(dumps)[0]):%H:%M} ({ago(max(dumps)[0], now)})"
                  if dumps else "Latest board dump: none in ~/Downloads")
+    lines.append(refresh_line(now, refresher))
     u = _json(ODDS_CACHE).get("usage", {})
     if u:
         groups = " · ".join(f"{g} {n}" for g, n in sorted((u.get("by_group") or {}).items()))

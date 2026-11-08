@@ -17,6 +17,8 @@ def _never_touch_real_downloads(tmp_path_factory, monkeypatch):
     """ops.auto_refresh writes boards into DOWNLOADS (~/Downloads by default): keep every test out of it."""
     from ops import auto_refresh
     monkeypatch.setattr(auto_refresh, "DOWNLOADS", tmp_path_factory.mktemp("downloads"))
+    monkeypatch.setattr(auto_refresh, "STATUS", tmp_path_factory.mktemp("ar_status") / "auto_refresh_status.json")
+    monkeypatch.setattr(auto_refresh, "LOCK", tmp_path_factory.mktemp("ar_lock") / "auto_refresh.lock")
 
 
 @pytest.fixture(autouse=True)
