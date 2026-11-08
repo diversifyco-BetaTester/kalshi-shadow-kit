@@ -93,7 +93,7 @@ def report(records: list[dict], since: float, until: float, cfg: dict) -> str:
            f"interp {c['flag_kalshi_interp']} · shading "
            + (f"on ({s['spread_mult']:g} x spread, +{s['interp_pts'] * 100:g} interp, +{s['thin_pts'] * 100:g} thin, "
               f"max {s['max_pts'] * 100:g} pts)" if s["enabled"] else "off")
-           + " · CLV is on the raw (unshaded) price"]
+           + " · CLV is on the raw (unshaded) price", snapshots.CLOSING_WARNING]
     if not records:
         return "\n".join(out + ["\nNo legs priced in this window."])
     by = Counter((r["sport"], r["source"]) for r in records)

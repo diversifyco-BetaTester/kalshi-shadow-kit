@@ -125,3 +125,21 @@ def test_alert_puts_each_note_indented_under_its_leg():
     assert lines[j + 2] == "   No recent data (player not found)"
     plain = alert_text((0.1, "flex", (l1, l2), False), "nhl", 0, NOW, 1.0)                  # --no-research
     assert "L5 avg" not in plain and "No recent data" not in plain
+
+
+def test_combo_stats_keep_their_canonical_name():
+    from local import enricher
+    for stat in ("points + rebounds + assists", "Points + Assists", "blocks + steals"):
+        assert enricher.stat_phrase("nba", stat) in enricher.COLUMNS["nba"]          # was collapsed to "a+b": no columns
+    assert enricher.stat_phrase("nba", "Pts+Rebs+Asts") == "points + rebounds + assists"  # board shorthand still maps
+
+
+def test_all_star_games_are_not_real_games():
+    from local import enricher
+    log = {"names": ["points"],
+           "events": {"a": {"gameDate": "2026-02-15T01:00Z", "eventNote": "NBA All-Star - Round Robin",
+                            "team": {"abbreviation": "STARS"}, "opponent": {"abbreviation": "WORLD"}},
+                      "b": {"gameDate": "2026-02-20T01:00Z", "team": {"abbreviation": "DET"}, "opponent": {"abbreviation": "NY"}}},
+           "seasonTypes": [{"displayName": "2025-26 Regular Season",
+                            "categories": [{"events": [{"eventId": "a", "stats": ["12"]}, {"eventId": "b", "stats": ["30"]}]}]}]}
+    assert [(g["opp"], g["event"], g["team"]) for g in enricher.games(log)] == [("NY", "b", "DET")]

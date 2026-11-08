@@ -71,12 +71,35 @@ CREATE TABLE IF NOT EXISTS slip_legs (id INTEGER PRIMARY KEY, slip_id TEXT, buil
 CREATE INDEX IF NOT EXISTS slip_legs_open ON slip_legs (close_p, start_ts);
 CREATE TABLE IF NOT EXISTS watch_legs (player TEXT, stat TEXT, line REAL, team TEXT, game TEXT, start_ts REAL,
     source TEXT, first_ts REAL, PRIMARY KEY (player, stat, line, start_ts, source));
+CREATE TABLE IF NOT EXISTS jit_events (id INTEGER PRIMARY KEY, cycle_ts REAL, ts REAL, sport TEXT, player TEXT, stat TEXT,
+    line REAL, side TEXT, source TEXT, start_ts REAL, refreshed INTEGER, watchlist INTEGER, event_json TEXT,
+    delta_json TEXT);
+CREATE TABLE IF NOT EXISTS shadow_prices (id INTEGER PRIMARY KEY, ts REAL, kind TEXT, board_ts REAL, sport TEXT,
+    player TEXT, stat TEXT, line REAL, odds_type TEXT, side TEXT, team TEXT, game TEXT, start_ts REAL, p_fair REAL,
+    source TEXT, method TEXT, pricing_json TEXT, price_age_s REAL, calc_version TEXT);
+CREATE INDEX IF NOT EXISTS shadow_prop ON shadow_prices (player, stat, line, odds_type, ts);
+CREATE TABLE IF NOT EXISTS propline_sweeps (id INTEGER PRIMARY KEY, ts REAL, sport TEXT, utc_day TEXT, requests INTEGER,
+    x_daily_used INTEGER, x_daily_limit INTEGER, x_daily_reset INTEGER, budget_used INTEGER, events_requested INTEGER,
+    legs_in_window INTEGER, legs_priced INTEGER, stopped TEXT, sweep_json TEXT, calc_version TEXT);
+CREATE TABLE IF NOT EXISTS propline_prices (id INTEGER PRIMARY KEY, sweep_id INTEGER, ts REAL, board_ts REAL, sport TEXT,
+    player TEXT, stat TEXT, line REAL, team TEXT, game TEXT, start_ts REAL, event_id TEXT, market_key TEXT,
+    read_kind TEXT, fetched_ts REAL, p_live REAL, p_shin REAL, p_sharp REAL, n_books INTEGER, unpriced_reason TEXT,
+    fair_json TEXT, books_json TEXT, presence_json TEXT, kalshi_json TEXT, ages_json TEXT, event_json TEXT,
+    dfs_json TEXT, calc_version TEXT);
+CREATE INDEX IF NOT EXISTS propline_prop ON propline_prices (player, stat, line, start_ts, ts);
 """
 # columns added after the first databases were written: (table, column, type)
 MIGRATIONS = [("cycles", "eligible_json", "TEXT"), ("cycles", "coverage_json", "TEXT"),
               ("slip_legs", "sport", "TEXT"), ("slip_legs", "units", "REAL"),
-              ("prices", "price_age_s", "REAL"), ("slip_legs", "price_age_s", "REAL"), ("slip_legs", "stats_json", "TEXT")]
+              ("prices", "price_age_s", "REAL"), ("slip_legs", "price_age_s", "REAL"), ("slip_legs", "stats_json", "TEXT"),
+              # 2026-11-04 logged-only signals (local/signals.py): never read by a builder
+              ("slip_legs", "display_json", "TEXT"), ("slip_legs", "leg_json", "TEXT"), ("slip_legs", "slip_json", "TEXT"),
+              ("cycles", "line_gap_json", "TEXT"), ("cycles", "watchlist_json", "TEXT")]
 CLOSE_KINDS = ("tick", "watch")  # a 'close' row repeats the last read's values at a later time: not a read
+# Accepted 2026-11-04 (closing-data inspection: 56 of 92 eligible closes stale, books CLV 67-73% unchanged): printed on
+# every CLV report until closing capture is redesigned.
+CLOSING_WARNING = ("WARNING: closing capture unreliable: not evaluable (books closes are often stale or the "
+                   "entry's own cache fetch; closing-capture redesign pending). No CLV below is evidence.")
 
 
 def leg_source(l: scanner.Leg) -> str:
@@ -189,7 +212,8 @@ class Snapshots:
 
     # ------------------------------------------------------------------ CLV
     def record_slip(self, builder: str, cycle_id: int, now: float, legs, ev: float, sent: bool,
-                    units: float | None = None, age_at: float | None = None) -> str | None:
+                    units: float | None = None, age_at: float | None = None, display: dict | None = None,
+                    leg_meta: dict | None = None, slip_meta: dict | None = None) -> str | None:
         """One row per leg of a chosen slip, at its entry fair price (raw_pick: unshaded, so CLV compares
         the market with itself). Paper slips re-chosen within
         DEDUPE_S are not recorded again. Returns the slip id, or None when it wasn't recorded."""
@@ -202,14 +226,143 @@ class Snapshots:
                 return None
         slip_id = f"{builder}:{now:.0f}|{slip_key}"
         at = now if age_at is None else age_at
+        dump = lambda d, l: None if d is None or id(l) not in d else json.dumps(d[id(l)])  # signals: logged only
         for l in legs:
             self.db.execute("INSERT INTO slip_legs (slip_id, builder, cycle_id, entry_ts, size, ev, sent, player, stat, line, "
-                            "side, team, game, start_ts, source, p_entry, sport, units, price_age_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "side, team, game, start_ts, source, p_entry, sport, units, price_age_s, display_json, leg_json, "
+                            "slip_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (slip_id, builder, cycle_id, now, len(legs), ev, int(sent), l.player, l.stat, l.line,
                              l.pick[0], l.team, l.game, l.start_ts, leg_source(l), l.raw_pick[1], l.sport or self.sport, units,
-                             price_age(l, at)))
+                             price_age(l, at), dump(display, l), dump(leg_meta, l),
+                             None if slip_meta is None else json.dumps(slip_meta)))
         self.db.commit()
         return slip_id
+
+    def slip_records(self, slip_id: str | None) -> dict:
+        """What was logged for one slip (Build 1 reads the alert's values back from here, never recomputes):
+        {"slip": slip_json, "legs": {(player, stat, line): {"display": display_json, "leg": leg_json}}}."""
+        out = {"slip": None, "legs": {}}
+        if not slip_id:
+            return out
+        for player, stat, line, d, lj, sj in self.db.execute(
+                "SELECT player, stat, line, display_json, leg_json, slip_json FROM slip_legs WHERE slip_id=?", (slip_id,)):
+            out["legs"][(player, stat, float(line))] = {"display": json.loads(d) if d else None,
+                                                        "leg": json.loads(lj) if lj else None}
+            if sj and out["slip"] is None:
+                out["slip"] = json.loads(sj)
+        return out
+
+    def prev_distinct(self, sport: str | None, player: str, stat: str, line: float, source: str, start_ts: float | None,
+                      before_ts: float, p_over: float) -> dict | None:
+        """Build 2: the newest logged read of this leg (same source and start) fetched before `before_ts` whose
+        P(More) differs from p_over: the last DISTINCT price before the current fetch. None if there is none."""
+        con, opened = self._prices_db(sport)
+        if con is None:
+            return None
+        try:
+            rows = con.execute("SELECT ts, side, p_fair, pricing_json, start_ts FROM prices WHERE player=? AND stat=? AND line=? "
+                               f"AND source=? AND kind IN {CLOSE_KINDS} AND ts <= ? ORDER BY ts DESC LIMIT 200",
+                               (player, stat, line, source, before_ts)).fetchall()
+        finally:
+            if opened:
+                con.close()
+        for ts, side, p, pricing, start in rows:
+            if start_ts and start and abs(start - start_ts) > 1:
+                continue
+            try:
+                detail = json.loads(pricing) if pricing else {}
+            except ValueError:
+                detail = {}
+            fetched = detail.get("fetched_ts") or ts
+            if fetched >= before_ts:
+                continue
+            po = p if side == "More" else 1 - p
+            if abs(po - p_over) > 1e-9:
+                books = [b.get("book") for b in detail.get("books") or [] if isinstance(b, dict) and b.get("book")]
+                return {"p_over": po, "fetched_ts": fetched, "line": line, "source": source,
+                        "books": sorted(books) if source == "books" else None, "method": detail.get("method"),
+                        "row_ts": ts}
+        return None
+
+    def record_jit_events(self, events: list[dict]) -> int:
+        """Build 2/5: every leg of a slip that went through the JIT path (refreshed or watchlisted), with its
+        prob_delta record. Logged only."""
+        from local import signals  # lazy: signals imports this module
+        n = 0
+        for ev in events:
+            prev = None
+            after, before = ev["after"], ev["before"]
+            if (ev["refreshed"] and after.get("p_over") is not None and after.get("fetched_ts")
+                    and not (before.get("p_over") is not None and abs(before["p_over"] - after["p_over"]) > 1e-9)):
+                prev = self.prev_distinct(ev["sport"], ev["player"], ev["stat"], ev["line"], after.get("source") or "",
+                                          ev["start_ts"], after["fetched_ts"], after["p_over"])
+            delta = signals.prob_delta(ev, prev)
+            w = signals.value(ev, "watchlist")
+            self.db.execute("INSERT INTO jit_events (cycle_ts, ts, sport, player, stat, line, side, source, start_ts, refreshed, "
+                            "watchlist, event_json, delta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (ev["cycle_ts"], ev["ts"], ev["sport"], ev["player"], ev["stat"], ev["line"], ev["side"],
+                             ev["source"], ev["start_ts"], int(ev["refreshed"]), None if w is None else int(w),
+                             json.dumps(ev), json.dumps(delta)))
+            n += 1
+        self.db.commit()
+        return n
+
+    def shadow_prices(self, now: float, legs: list[scanner.Leg], board_ts: float | None = None,
+                      age_at: float | None = None) -> int:
+        """Build 4: demon/goblin legs priced from Kalshi only, as kind "shadow_promo" rows in their own table
+        (never in `prices`, which live CLV, steam and the replay read). Change-only, like prices()."""
+        from local import signals
+        last = self.__dict__.setdefault("shadow_last", {})
+        written = 0
+        for l in legs:
+            q = next((q for q in l.quotes if q.venue == "kalshi"), None)
+            if q is None or l.p_over is None:
+                continue
+            key = (l.player, l.stat, l.line, l.odds_type, l.game_date)
+            p = l.p_over  # demons/goblins are More only
+            prev = last.get(key)
+            if prev and abs(prev[1] - p) < CHANGE and now - prev[0] < HEARTBEAT_S:
+                continue
+            age = price_age(l, now if age_at is None else age_at)
+            self.db.execute("INSERT INTO shadow_prices (ts, kind, board_ts, sport, player, stat, line, odds_type, side, team, game, "
+                            "start_ts, p_fair, source, method, pricing_json, price_age_s, calc_version) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (now, "shadow_promo", board_ts, l.sport or self.sport, l.player, l.stat, l.line, l.odds_type,
+                             "More", l.team, l.game, l.start_ts, p, "kalshi", (q.detail or {}).get("method") or "unknown",
+                             json.dumps(q.detail or {}), age, signals.VERSIONS["shadow_promo"]))
+            last[key] = (now, p)
+            written += 1
+        self.db.commit()
+        return written
+
+    def propline_sweep(self, rec: dict) -> int:
+        """PropLine shadow (local/propline_shadow.py): one sweep's requests, quota headers, coverage and errors."""
+        cur = self.db.execute("INSERT INTO propline_sweeps (ts, sport, utc_day, requests, x_daily_used, x_daily_limit, "
+                              "x_daily_reset, budget_used, events_requested, legs_in_window, legs_priced, stopped, sweep_json, "
+                              "calc_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                              (rec["ts"], rec["sport"], rec["utc_day"], rec["requests"], rec["x_daily_used"],
+                               rec["x_daily_limit"], rec["x_daily_reset"], rec["budget_used"], rec["events_requested"],
+                               rec["legs_in_window"], rec["legs_priced"], rec["stopped"], json.dumps(rec), rec["calc_version"]))
+        self.db.commit()
+        return cur.lastrowid
+
+    def propline_prices(self, sweep_id: int, board_ts: float | None, rows: list[dict]) -> int:
+        """PropLine shadow rows: every read (not change-only), plus no-read rows with their reason. Own table: never
+        read by live CLV, steam, the replay or any builder."""
+        for r in rows:
+            f = r["fair"]
+            self.db.execute("INSERT INTO propline_prices (sweep_id, ts, board_ts, sport, player, stat, line, team, game, "
+                            "start_ts, event_id, market_key, read_kind, fetched_ts, p_live, p_shin, p_sharp, n_books, "
+                            "unpriced_reason, fair_json, books_json, presence_json, kalshi_json, ages_json, event_json, "
+                            "dfs_json, calc_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (sweep_id, r["ts"], board_ts, r["sport"], r["player"], r["stat"], r["line"], r["team"],
+                             r["game"], r["start_ts"], r["event_id"], r["market_key"], r["read_kind"], r["fetched_ts"],
+                             f["p_live"]["value"], f["p_shin"]["value"], f["p_sharp"]["value"],
+                             sum(1 for q in r["books"].values() if "fair_live" in q), r["unpriced_reason"],
+                             json.dumps(f), json.dumps(r["books"]), json.dumps(r["presence"]), json.dumps(r["kalshi"]),
+                             json.dumps(r["ages"]), json.dumps(r["event"]), json.dumps(r["dfs"]), f["p_live"]["calc_version"]))
+        self.db.commit()
+        return len(rows)
 
     def record_stats(self, slip_id: str, l: scanner.Leg, rec: dict) -> int:
         """Store a leg's stats-vs-market gap (local/stat_research.py) on its slip_legs row."""
@@ -278,16 +431,19 @@ class Snapshots:
         self.db.commit()
 
     def cycle(self, now: float, board_ts: float, stats: dict, live: list[dict], paper: dict | None,
-              eligible: list | None = None, coverage: dict | None = None) -> int:
+              eligible: list | None = None, coverage: dict | None = None, line_gap: list | None = None,
+              watchlist: dict | None = None) -> int:
         """`eligible`: the legs (leg_ref) both builders chose from, after every filter (min fair prob,
         injury guard, cooldown, whole-number lines) plus pooled legs: the backtest replays from exactly
         these. `coverage`: {stat: [legs, priced]} this cycle."""
         cur = self.db.execute("INSERT INTO cycles (ts, board_ts, legs, priced, good, whole_dropped, live_json, paper_json, "
-                              "eligible_json, coverage_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                              "eligible_json, coverage_json, line_gap_json, watchlist_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                               (now, board_ts, stats.get("legs"), stats.get("priced"), stats.get("good"),
                                stats.get("whole_dropped"), json.dumps(live), json.dumps(paper),
                                None if eligible is None else json.dumps(eligible),
-                               None if coverage is None else json.dumps(coverage)))
+                               None if coverage is None else json.dumps(coverage),
+                               None if line_gap is None else json.dumps(line_gap),
+                               None if watchlist is None else json.dumps(watchlist)))
         return cur.lastrowid
 
     def prices(self, cycle_id: int, now: float, legs: list[scanner.Leg], age_at: float | None = None) -> int:
@@ -348,7 +504,7 @@ def load_board_props(feed: Path, sport: str) -> tuple[str, list[dict]]:
 def clv_lines(records: list[dict], include_stale: bool = False, builders=("live", "paper")) -> list[str]:
     """CLV summary per builder. Each record: builder, entry_ts, source, clv (None: no close yet/ever) and
     note (None: open, "": clean close, "stale close ...", "no ... price before start")."""
-    out = ["CLV per leg = closing fair prob - entry fair prob, side taken, same source (points)"]
+    out = ["CLV per leg = closing fair prob - entry fair prob, side taken, same source (points)", CLOSING_WARNING]
     for builder in builders:
         mine = [r for r in records if r["builder"] == builder]
         settled = [r for r in mine if r["clv"] is not None and (include_stale or not r["note"])]

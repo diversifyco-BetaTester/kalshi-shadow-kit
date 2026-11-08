@@ -317,6 +317,45 @@ def parse_json(data: dict, sport: str) -> tuple[list[dict], list[str]]:
     return rows, bad
 
 
+PROMO_TYPES = ("demon", "goblin")
+
+
+def promo_rows(data: dict, sport: str) -> list[dict]:
+    """SHADOW ONLY (local/signals.py, Build 4): the board's demon/goblin projections for this league, as CSV-like
+    rows with their odds_type, for Kalshi-only shadow pricing. Never written to the lines CSV, so they never
+    reach a slip, the pool or a payout. Same stat/team mapping as parse_json; combo, live, non-single-stat,
+    promo-flagged, discounted and flash-sale projections are left out. Every distinct line is kept (a player
+    can carry a goblin and a demon on one stat)."""
+    out, seen = [], set()
+    for prop in (data or {}).get("props") or []:
+        league = str(prop.get("league") or "").upper()
+        if league and league != sport.upper():
+            continue
+        odds_type = str(prop.get("odds_type") or "").lower()
+        name, line = prop.get("player"), prop.get("line")
+        if odds_type not in PROMO_TYPES or not name or not isinstance(line, (int, float)):
+            continue
+        if "(combo)" in str(prop.get("stat") or "").lower() or " + " in name or prop.get("event_type") == "combo":
+            continue
+        if (prop.get("is_promo") or prop.get("discount_name") or prop.get("discount_percentage")
+                or prop.get("flash_sale_line_score") not in (None, "", prop.get("line"))
+                or prop.get("projection_type") not in (None, "", "Single Stat")
+                or prop.get("status") not in (None, "", "pre_game") or prop.get("is_live") or prop.get("in_game")):
+            continue
+        r = row(sport, name, str(prop.get("team") or ""), str(prop.get("position") or ""), "@",
+                str(prop.get("opponent") or ""), f"{line:g}", str(prop.get("stat") or ""))
+        if isinstance(r, str):
+            continue
+        r["game"] = " v ".join(sorted(r["game"].split("@")))
+        r["odds_type"] = odds_type
+        r["start_time"] = str(prop.get("start_time") or "")
+        key = (r["player"], r["stat"], r["line"], odds_type, r["start_time"])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
 def load_board(path: str | Path, sport: str) -> tuple[list[dict], list[str]]:
     """A board file in either form: board.json from the bookmarklet, or pasted text."""
     text = Path(path).read_text()

@@ -609,9 +609,12 @@ class OddsBook:
             skipped += await self.ensure(sport, e["id"], needed, now, e.get("sport_key"), force_age_s)
             cached = self.cache["odds"].get(e["id"], {})
             off_main = []
+            gap_on = pipeline_config.CONFIG.get("signals", {}).get("line_gap", False)  # Build 3: logged only
             for l in mine:
                 c = self.fresh(cached, markets[l.stat], now)
                 if not c:
+                    if gap_on and not l.whole_line:
+                        _line_gap(l, None, sport, e["id"], markets[l.stat])
                     continue
                 if l.whole_line:  # its push needs the N - 0.5 and N + 0.5 rungs: the alternate ladder
                     if any(market_overround(o) for o in c["books"].values()):
@@ -626,6 +629,10 @@ class OddsBook:
                                            "fetched_ts": c["ts"]}  # when the cache entry was fetched (price age)
                 elif any(market_overround(o) for o in c["books"].values()):
                     off_main.append(l)  # not at PrizePicks' line (or not on the main market at all)
+                    if gap_on:
+                        _line_gap(l, c, sport, e["id"], markets[l.stat])
+                elif gap_on:
+                    _line_gap(l, c, sport, e["id"], markets[l.stat])
             if not off_main or not pipeline_config.CONFIG["books"]["alt_ladder"]:
                 continue  # no alternate ladder: never requested (books.alt_ladder off since 2026-10-23)
             skipped += await self.ensure(sport, e["id"], sorted({markets[l.stat] + ALT for l in off_main}), now,
@@ -659,6 +666,17 @@ class OddsBook:
                               f"{u.get('remaining', '?')} left (reserve {self.reserve})")
         self.save()
         return priced
+
+
+def _line_gap(l: scanner.Leg, cached: dict | None, sport: str, event_id: str, market: str) -> None:
+    """Build 3 (local/signals.py line_gap): record the PrizePicks-vs-books main line gap on a leg the books left
+    unpriced, from the market ALREADY cached. Reads only; never requests, never touches a quote, never raises."""
+    try:
+        from local import signals  # lazy: logged-only module
+        l.line_gap = signals.line_gap(l, cached, sport, event_id, market)
+    except Exception as err:  # noqa: BLE001 — a logging feature must never stop pricing
+        l.line_gap = {"calc_version": "line_gap/1", "player": l.player, "stat": l.stat, "sport": sport,
+                      "pp_book_line_gap_units": {"value": None, "missing": f"error:{type(err).__name__}"}}
 
 
 def sources(leg: scanner.Leg) -> str:
