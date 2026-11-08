@@ -24,6 +24,13 @@ key by key. Payout tables are {legs: {hits: multiplier}} as JSON objects (string
                               1 are also reservations: one group can't drain another's credits before its
                               games enter the pricing window. All sentinels read the same config, so they
                               enforce the same split on the one shared cap (restart them after editing it).
+  odds_budget.shares_by_weekday  {"sat": {...}}: that weekday's shares instead of `shares` (mon..sun, local
+                              date, same day the spend resets); {} for a day = no split, every sport spends
+                              from the whole cap (e.g. Saturdays, when NFL has no slate and its half sat idle)
+  odds_budget.uncapped        true (2026-11-07, 20,000-credit plan): no daily cap at all, so no per-sport
+                              shares either (they are fractions of the cap); only the RESERVE (25) and the
+                              monthly balance limit spend. --odds-budget is then ignored. Spend is still
+                              tracked per day and per group for /status
   min_fair_by_sport           per-sport floor on a leg's fair probability to join any slip ({"nhl": 0.57}); a sport
                               not listed uses the sentinel's --min-ev (54.5% in flex mode), and a floor is never
                               below --min-ev. Applies to a sentinel's own legs and to legs pooled from other sports
@@ -103,7 +110,7 @@ DEFAULTS = {
                 "max_pts": 0.03},
     "jit_refresh": {"enabled": True, "max_age_s": 900, "on_refused": "send"},
     "stat_feature": {"enabled": True, "games": 10, "min_games": 5},
-    "odds_budget": {"shares": {"nfl": 0.5, "other": 0.5}},
+    "odds_budget": {"shares": {"nfl": 0.5, "other": 0.5}, "shares_by_weekday": {}, "uncapped": False},
     "staking": {"kelly": 0.25, "unit_pct": 0.01, "min_units": 0.5, "max_units": 2.0, "below_min": "skip"},
     # logged-only signals (local/signals.py, 2026-11-04): toggles for LOGGING, never for selection
     "signals": {"line_gap": True, "shadow_promo": True, "propline_shadow": False},

@@ -2,10 +2,23 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _never_send_real_telegram(monkeypatch):
+    """ops.telegram falls back to TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID from the environment (a test that
+    loaded .env would post to the real chat): every real HTTP send raises instead."""
+    from ops import telegram
+
+    def blocked(req, timeout=None):
+        raise RuntimeError("test tried to send a real Telegram message")
+    monkeypatch.setattr(telegram, "_urlopen", blocked)
+
+
+@pytest.fixture(autouse=True)
 def _never_touch_real_downloads(tmp_path_factory, monkeypatch):
     """ops.auto_refresh writes boards into DOWNLOADS (~/Downloads by default): keep every test out of it."""
     from ops import auto_refresh
     monkeypatch.setattr(auto_refresh, "DOWNLOADS", tmp_path_factory.mktemp("downloads"))
+    monkeypatch.setattr(auto_refresh, "STATUS", tmp_path_factory.mktemp("ar_status") / "auto_refresh_status.json")
+    monkeypatch.setattr(auto_refresh, "LOCK", tmp_path_factory.mktemp("ar_lock") / "auto_refresh.lock")
 
 
 @pytest.fixture(autouse=True)

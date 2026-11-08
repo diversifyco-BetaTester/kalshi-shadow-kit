@@ -97,7 +97,7 @@ from local import signals  # logged-only (Builds 1-5): called after slips are cl
 from local import steam as steam_mod
 from local import prize_picks_ev_scraper as scanner
 from local.parse_board import SPORTS, board_path, lines_path, load_board, promo_rows, write_csv
-from ops.telegram import send_async
+from ops.telegram import send_status_async as send_async  # -> sent | failed | unconfirmed
 
 STALE_AFTER_MIN = 30  # PrizePicks moves lines; say so when the pasted board is older than this
 STALE_NUDGE_MIN = 15  # print a "click the bookmarklet" notice once the board is this old
@@ -663,6 +663,7 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
         l.sport = a.sport
     if not legs:
         print(f"{time.strftime('%H:%M:%S')} {a.csv} has no standard legs; click the bookmarklet or paste into {a.board}")
+        heartbeat(a, now, state="board has no standard legs")
         return
     all_legs = legs
     legs, started = scanner.pregame(legs, now)
@@ -672,12 +673,15 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
         print(nudge_text(a.sport, board_age, started, len(legs)))  # stdout only: Telegram is for slips
     if not legs:
         await watch_only(a, now)  # nothing left to alert, but watched legs still need prices until their start
+        heartbeat(a, now, state=f"every board leg has started (board {board_age:.0f} min old)", board_age_min=round(board_age, 1))
         return
     if a.max_board_age and board_age > a.max_board_age:
         # a line the app has since moved (28.5 on the board, 22.5 in the app) would alert as an edge
         print(f"{time.strftime('%H:%M:%S')} board is {board_age:.0f} min old (> {a.max_board_age:g}): "
               f"not pricing or alerting until a fresh board arrives")
         await watch_only(a, now)
+        # the loop is alive, it is just waiting: /status must not read this as a hung sentinel
+        heartbeat(a, now, state=f"waiting for a fresh board ({board_age:.0f} min old)", board_age_min=round(board_age, 1))
         return
     quotes = await scanner.kalshi_quotes(SPORTS[a.sport]["series"])
     read_ts = time.time()  # the Kalshi read behind every Kalshi price this cycle (snapshots: price age)
@@ -866,7 +870,9 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
             display = {id(l): (recs.get((l.player, l.stat, float(l.line))) or {}).get("display") for l in e[2]}
             msg = alert_text(e, a.sport, board_age, now, units, research, status, display)
             print(msg)
-            status = ("sent" if await send_async(msg, chat_id=chat_id) else "failed") if chat_id else "terminal"
+            # "unconfirmed" (reply timed out after the request went out) counts as delivered: its legs stay
+            # claimed, or the next cycle re-sends the same slip (2026-11-07: one slip arrived 4 times)
+            status = delivery(await send_async(msg, chat_id=chat_id)) if chat_id else "terminal"
         except Exception as err:  # noqa: BLE001 — one slip's alert failing must not strand its claimed legs
             print(f"{time.strftime('%H:%M:%S')} alert failed: {err!r}")
             status = "failed"
@@ -877,6 +883,12 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
             ledger.append(ledger.row(e, units, now, status, source_tag), a.ledger)
         except OSError as err:  # a full disk must not stop the alerts
             print(f"{time.strftime('%H:%M:%S')} ledger write failed: {err!r}")
+
+
+def delivery(result) -> str:
+    """A send's outcome as the ledger's telegram status: "sent" | "failed" | "unconfirmed" (a plain bool,
+    from an injected sender, maps to sent/failed). Only "failed" releases a slip's legs."""
+    return result if result in ("sent", "failed", "unconfirmed") else ("sent" if result else "failed")
 
 
 async def main() -> None:
@@ -920,7 +932,8 @@ async def main() -> None:
     ap.add_argument("--odds-budget", type=int, default=fetch_odds.DAILY_CAP,
                     help="Odds API credits per day; a higher value raises the cap shared by every sentinel "
                          "for today (the reserve is always kept). The cap is split by sport with "
-                         "pipeline_config odds_budget.shares (default NFL half, every other sport half)")
+                         "pipeline_config odds_budget.shares (default NFL half, every other sport half); "
+                         "ignored when odds_budget.uncapped is true")
     ap.add_argument("--window-hours", type=float, default=fetch_odds.LOOKAHEAD_H,
                     help="only buy sportsbook odds for games starting within this many hours")
     ap.add_argument("--no-odds", action="store_true", help="don't price Kalshi-unpriced legs from The Odds API")
@@ -975,7 +988,7 @@ async def main() -> None:
     print(f"sentinel: {a.sport.upper()} | feed {a.feed} or {a.board} | every {a.interval:.0f}s | alert >= {leg_floor(a, a.sport):.1%}{' (flex 5/6)' if a.flex else ''}"
           + (" · floors " + ", ".join(f"{s.upper()} {leg_floor(a, s):.1%}" for s in sorted(pipeline_config.CONFIG["min_fair_by_sport"]))
              if pipeline_config.CONFIG["min_fair_by_sport"] else "") + " | "
-          + (f"books fallback on (games within {a.odds.window_h:g} h, budget {a.odds.cap()}/day shared, "
+          + (f"books fallback on (games within {a.odds.window_h:g} h, budget {'uncapped' if a.odds.uncapped else f'{a.odds.cap()}/day shared'}, "
              f"reserve {a.odds.reserve})" if a.odds
              else "no books fallback") + " | "
           + (f"Telegram chat {chat_id}" if chat_id else "no TELEGRAM_ALERT_CHAT_ID: terminal only"))

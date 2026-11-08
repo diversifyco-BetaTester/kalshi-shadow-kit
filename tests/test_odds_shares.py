@@ -80,3 +80,28 @@ def test_no_shares_means_no_split(tmp_path):
 def test_budget_line_for_the_sentinel_startup_log():
     u = {"used": 12, "cap": 80, "by_group": {"nfl": 10, "other": 2}}
     assert fo.budget_line(u, {"nfl": 0.5, "other": 0.5}) == "Odds API today: 12/80 · nfl 10/40 · other 2/40"
+
+
+def test_uncapped_ignores_the_daily_cap_and_shares_but_keeps_the_reserve(tmp_path, monkeypatch):
+    monkeypatch.setitem(pipeline_config.CONFIG["odds_budget"], "uncapped", True)
+    api = FakeAPI()
+    b = book(tmp_path, api, daily_cap=80)
+    asyncio.run(b.events("nhl", NOW))                       # free: learns the balance (400)
+    spend(b, "nhl", 300)                                    # far past 80 and past NHL's 40
+    assert b.group_limit("nhl") is None and b.affordable(1, "nhl") and b.affordable(1, "nfl")
+    b.cache["usage"]["remaining"] = 26
+    assert b.affordable(1, "nhl") and not b.affordable(2, "nhl")       # 25 must remain
+    line = fo.budget_line(b.usage(), b.shares)
+    assert "no daily cap" in line and "other 300" in line
+
+
+def test_weekday_shares_replace_the_default_split_on_that_day(tmp_path, monkeypatch):
+    today = fo.WEEKDAYS[date.today().weekday()]
+    monkeypatch.setitem(pipeline_config.CONFIG["odds_budget"], "shares_by_weekday", {today: {"nfl": 0.1, "other": 0.9}})
+    b = fo.OddsBook("k", cache=tmp_path / "c.json", daily_cap=80, get=FakeAPI())
+    assert b.group_limit("nfl") == 8 and b.group_limit("nhl") == 72
+    monkeypatch.setitem(pipeline_config.CONFIG["odds_budget"], "shares_by_weekday", {today: {}})
+    assert b.group_limit("nhl") is None                      # {} for a day: no split
+    other = fo.WEEKDAYS[(date.today().weekday() + 1) % 7]
+    monkeypatch.setitem(pipeline_config.CONFIG["odds_budget"], "shares_by_weekday", {other: {"other": 1.0}})
+    assert b.group_limit("nfl") == 40                        # another day's entry doesn't apply today

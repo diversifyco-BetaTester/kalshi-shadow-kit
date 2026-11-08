@@ -1,7 +1,7 @@
 """
 auto_refresh.py — refresh the sentinels' PrizePicks boards from your own open Chrome tab.
 
-Every --interval minutes (7) between --start-hour and --end-hour (12:00-21:00 local), in the first
+Every --interval minutes (7) between --start-hour and --end-hour (default 0-24: around the clock), in the first
 open Chrome tab whose title or URL contains "PrizePicks":
   1. reload it (skip with --no-reload) and wait for the board,
   2. click each sport tab in --leagues (NFL, NHL, MLB), CLICK_DELAY_S apart, so the app loads every
@@ -46,7 +46,7 @@ DUMP_JS = ROOT / "scripts" / "prizepicks_scraper.js"
 SYNC = ROOT / "ops" / "sync_boards.sh"
 DOWNLOADS = Path(os.environ.get("DOWNLOADS", Path.home() / "Downloads"))
 INTERVAL_MIN = 7  # PrizePicks bumps lines and flips them to goblin/demon within ~20 min
-START_HOUR, END_HOUR = 12, 21
+START_HOUR, END_HOUR = 0, 24  # 24/7 since 2026-11-07 (overnight alerts); --start-hour/--end-hour narrow it
 LOAD_TIMEOUT_S = 60
 LEAGUES = ("NFL", "NHL", "MLB")
 CLICK_DELAY_S = 2.5  # after each sport tab click, for the app to fetch that league
@@ -225,6 +225,49 @@ def write_board(board: dict, downloads: Path | None = None) -> Path:
 
 
 LOCK = ROOT / "data" / "auto_refresh.lock"
+# Last outcome of every refresh (loop or Telegram /refresh), for /status: a run of failures (2026-11-08: Chrome
+# stopped answering at 01:28 and 20 refreshes failed unnoticed until the battery died) must be visible.
+STATUS = ROOT / "data" / "auto_refresh_status.json"
+
+
+def synced(report: str) -> bool:
+    """True when a refresh wrote and synced a board (every no-board outcome says so in its report)."""
+    return "boards unchanged" not in report and "nothing refreshed" not in report
+
+
+def record(ok: bool, note: str, now: float | None = None, **extra) -> None:
+    """Update STATUS (last success, failures in a row, last error). Never raises."""
+    now = time.time() if now is None else now
+    try:
+        st = json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        st = {}
+    st.update(last_attempt_ts=now, pid=os.getpid(), sleeping_until=None, **extra)
+    if ok:
+        st.update(last_ok_ts=now, fails_in_row=0, last_error=None)
+    else:
+        st.update(fails_in_row=int(st.get("fails_in_row") or 0) + 1, last_error=note[:200])
+    try:
+        STATUS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATUS.with_name(f".{STATUS.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(st))
+        os.replace(tmp, STATUS)
+    except OSError:
+        pass
+
+
+def record_sleep(until: float) -> None:
+    """The loop is outside its hour window until `until`: /status says so instead of warning."""
+    try:
+        st = json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        st = {}
+    st["sleeping_until"] = until
+    try:
+        STATUS.parent.mkdir(parents=True, exist_ok=True)
+        STATUS.write_text(json.dumps(st))
+    except OSError:
+        pass
 
 
 def refresh(reload: bool = True, wanted: tuple[str, ...] = LEAGUES) -> str:
@@ -235,9 +278,14 @@ def refresh(reload: bool = True, wanted: tuple[str, ...] = LEAGUES) -> str:
     with open(LOCK, "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            return _refresh(reload, wanted)
+            report = _refresh(reload, wanted)
+        except Exception as e:
+            record(False, f"{type(e).__name__}: {e}")
+            raise
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
+    record(synced(report), report)
+    return report
 
 
 def _refresh(reload: bool = True, wanted: tuple[str, ...] = LEAGUES) -> str:
@@ -311,8 +359,9 @@ def main() -> None:
     ap.add_argument("--diagnose", action="store_true",
                     help="read-only: show exactly what Chrome returns for each PrizePicks tab, then exit")
     ap.add_argument("--interval", type=float, default=INTERVAL_MIN, help="minutes between refreshes")
-    ap.add_argument("--start-hour", type=int, default=START_HOUR)
-    ap.add_argument("--end-hour", type=int, default=END_HOUR, help="no refresh starts at or after this hour")
+    ap.add_argument("--start-hour", type=int, default=START_HOUR, help="first hour of the refresh window (default 0)")
+    ap.add_argument("--end-hour", type=int, default=END_HOUR,
+                    help="no refresh starts at or after this hour (default 24: no nightly pause)")
     a = ap.parse_args()
     if a.diagnose:
         return diagnose()
@@ -321,6 +370,7 @@ def main() -> None:
         when = next_run(datetime.now(), a.start_hour, a.end_hour)
         if not a.once and when > datetime.now():
             print(f"{stamp()} outside {a.start_hour}:00-{a.end_hour}:00: sleeping until {when:%a %H:%M}", flush=True)
+            record_sleep(when.timestamp())
             time.sleep((when - datetime.now()).total_seconds())
         try:
             print(f"{stamp()} {refresh(not a.no_reload, tuple(x.upper() for x in a.leagues))}", flush=True)

@@ -17,6 +17,12 @@ def test_hour_window():
     assert ar.next_run(d(21, 30), 12, 21) == datetime(2026, 10, 16, 12)   # evening: noon tomorrow
 
 
+def test_default_window_is_around_the_clock():
+    d = lambda h, m=0: datetime(2026, 11, 7, h, m)
+    for h, m in ((0, 0), (3, 30), (11, 59), (21, 0), (23, 59)):
+        assert ar.next_run(d(h, m), ar.START_HOUR, ar.END_HOUR) == d(h, m)   # never sleeps until a window
+
+
 class FakeBoard:
     """osa_raw stand-in for one PrizePicks tab. A reload shows the featured sport (NFL) only; clicking a
     sport tab adds that league's projections to the store, unless it is listed in `slow` (first click
@@ -149,3 +155,26 @@ def test_diagnose_is_read_only(monkeypatch, capsys):
     monkeypatch.setattr(ar, "osa_raw", chrome)
     ar.diagnose()
     assert calls == ["list", "probe", "dump"] and "props=0" in capsys.readouterr().out    # never "reload"
+
+
+def test_every_refresh_records_its_outcome_for_status(monkeypatch):
+    import json as _json
+    monkeypatch.setattr(ar, "_refresh", lambda reload, wanted: "the board never showed its sport tabs: boards unchanged")
+    ar.refresh()
+    ar.refresh()
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 2 and "last_ok_ts" not in st and "boards unchanged" in st["last_error"]
+    monkeypatch.setattr(ar, "_refresh", lambda reload, wanted: "13874 props {'NFL': 8833} | Boards synced for NFL.")
+    ar.refresh()
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 0 and st["last_ok_ts"] and st["last_error"] is None
+
+    def boom(reload, wanted):
+        raise ar.ChromeError("osascript timed out")
+    monkeypatch.setattr(ar, "_refresh", boom)
+    try:
+        ar.refresh()
+    except ar.ChromeError:
+        pass
+    st = _json.loads(ar.STATUS.read_text())
+    assert st["fails_in_row"] == 1 and "osascript timed out" in st["last_error"] and st["last_ok_ts"]
