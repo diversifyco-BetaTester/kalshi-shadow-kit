@@ -214,3 +214,32 @@ def test_slips_under_the_minimum_stake_are_not_sent_or_claimed(tmp_path, monkeyp
     assert sends == [] and not a.sent_props_cache and not (tmp_path / "l.csv").exists()   # 6 x 55%: +EV, Kelly < 0.5u
     out = capsys.readouterr().out
     assert "skipped (Kelly stake under 0.5u)" in out and ", 0 new" in out
+
+
+def test_a_too_old_board_still_writes_a_heartbeat(tmp_path, monkeypatch):
+    """2026-11-07: a board past --max-board-age skipped pricing WITHOUT a heartbeat, so /status showed a
+    healthy, waiting sentinel as "last cycle 97 min ago"."""
+    import asyncio
+    import os
+    import time as _time
+    from pathlib import Path
+    from types import SimpleNamespace
+    from local import sentinel
+
+    async def no_quotes(series):
+        raise AssertionError("a too-old board must not be priced")
+    monkeypatch.setattr(sentinel.scanner, "kalshi_quotes", no_quotes)
+    feed, csv = tmp_path / "cfb_board.json", tmp_path / "lines_cfb.csv"
+    feed.write_text(json.dumps({"props": [{"player": "Jeremiah Smith", "team": "OSU", "league": "CFB",
+                                           "stat": "Receiving Yards", "line": 84.5, "opponent": "TEX",
+                                           "start_time": "2099-01-01T00:00:00Z", "odds_type": "standard"}]}))
+    old = _time.time() - 116 * 60
+    os.utime(feed, (old, old))
+    a = SimpleNamespace(sport="cfb", feed=str(feed), board=str(tmp_path / "board_cfb.txt"), csv=str(csv), seen=(),
+                        nudge={}, stale_min=45, max_board_age=20, min_ev=0.545, flex=True, odds=None, pool=None,
+                        dedupe_min=30, kelly=0.25, unit_pct=0.01, ledger=tmp_path / "slips.csv", research=False)
+    a.seen = sentinel.refresh_csv(sentinel.newest_feed(a.feed, a.board), csv, "cfb", a.seen)
+    t0 = _time.time()
+    asyncio.run(sentinel.cycle(a, [], chat_id=""))
+    hb = json.loads(Path(sentinel.HEARTBEAT.format(sport="cfb")).read_text())
+    assert hb["ts"] >= t0 and hb["state"] == "waiting for a fresh board (116 min old)" and hb["board_age_min"] >= 116

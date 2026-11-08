@@ -98,8 +98,8 @@ def status(now: float | None = None, pids: dict[str, list[int]] | None = None) -
         elif not hb or now - hb.get("ts", 0) > 180:
             alive = f"⚠️ running, last cycle {ago(hb.get('ts'), now)}"
         else:
-            alive = "✅ " + (f"{hb.get('priced', 0)}/{hb.get('legs', 0)} priced, {hb.get('good', 0)} ≥ min, "
-                             f"{hb.get('slips', 0)} slip(s)" if hb.get("state") == "ok" else hb.get("state", "ok"))
+            alive = ("✅ " + f"{hb.get('priced', 0)}/{hb.get('legs', 0)} priced, {hb.get('good', 0)} ≥ min, "
+                     f"{hb.get('slips', 0)} slip(s)") if hb.get("state", "ok") == "ok" else "⏸️ " + html.escape(str(hb["state"]))
         dup = f" ({n} copies!)" if n > 1 else ""
         lines.append(f"• <b>{sport.upper()}</b>{dup}: {alive} · {board}")
     dumps = [(Path(f).stat().st_mtime, Path(f).name) for f in glob.glob(str(DOWNLOADS / "*_board.json"))]

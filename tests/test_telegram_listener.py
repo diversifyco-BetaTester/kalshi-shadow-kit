@@ -167,3 +167,9 @@ def test_pnl_is_whitelisted_and_survives_an_empty_or_missing_ledger(state, monke
 
 def test_help_lists_the_new_commands(state):
     assert "/pnl (or /summary)" in tl.handle(update("/help"), ME, NoRefresh(), NOW)
+
+
+def test_status_shows_a_waiting_sentinel_as_alive_not_hung(state):
+    (state / ".heartbeat_nba.json").write_text(json.dumps({"ts": NOW - 40, "state": "waiting for a fresh board (116 min old)"}))
+    s = tl.status(NOW)
+    assert "• <b>NBA</b>: ⏸️ waiting for a fresh board (116 min old)" in s and "last cycle" not in s.split("NBA")[1].split("\n")[0]

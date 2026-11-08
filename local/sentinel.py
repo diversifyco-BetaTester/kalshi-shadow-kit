@@ -649,6 +649,7 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
         l.sport = a.sport
     if not legs:
         print(f"{time.strftime('%H:%M:%S')} {a.csv} has no standard legs; click the bookmarklet or paste into {a.board}")
+        heartbeat(a, now, state="board has no standard legs")
         return
     all_legs = legs
     legs, started = scanner.pregame(legs, now)
@@ -658,12 +659,15 @@ async def cycle(a, sent: list[tuple[float, frozenset, float]], chat_id: str) -> 
         print(nudge_text(a.sport, board_age, started, len(legs)))  # stdout only: Telegram is for slips
     if not legs:
         await watch_only(a, now)  # nothing left to alert, but watched legs still need prices until their start
+        heartbeat(a, now, state=f"every board leg has started (board {board_age:.0f} min old)", board_age_min=round(board_age, 1))
         return
     if a.max_board_age and board_age > a.max_board_age:
         # a line the app has since moved (28.5 on the board, 22.5 in the app) would alert as an edge
         print(f"{time.strftime('%H:%M:%S')} board is {board_age:.0f} min old (> {a.max_board_age:g}): "
               f"not pricing or alerting until a fresh board arrives")
         await watch_only(a, now)
+        # the loop is alive, it is just waiting: /status must not read this as a hung sentinel
+        heartbeat(a, now, state=f"waiting for a fresh board ({board_age:.0f} min old)", board_age_min=round(board_age, 1))
         return
     quotes = await scanner.kalshi_quotes(SPORTS[a.sport]["series"])
     read_ts = time.time()  # the Kalshi read behind every Kalshi price this cycle (snapshots: price age)
